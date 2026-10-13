@@ -27,9 +27,7 @@ def load_policies():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-policies = load_policies()
-
-# Mخطط صارم يمنع التخمين وحقن الحقول الغريبة (Strict Constrained Model)
+# مخطط صارم يمنع التخمين وحقن الحقول الغريبة
 class StrictTransactionPayload(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -55,6 +53,8 @@ def health_check():
 @app.post("/v1/governance/evaluate", tags=["Governance"])
 def evaluate_transaction(payload: StrictTransactionPayload):
     try:
-        return evaluate_governance(payload.model_dump(), policies)
+        # قراءة السياسات ديناميكياً لضمان التطابق اللحظي
+        current_policies = load_policies()
+        return evaluate_governance(payload.model_dump(), current_policies)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
