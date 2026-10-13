@@ -1,23 +1,60 @@
-﻿from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional
-from app.engine import PolicyManager, DeterministicGate
+﻿import yaml
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, ConfigDict
+from app.engine import evaluate_governance
 
-app = FastAPI(title="Zero-Data Intent Governance Gateway", version="2.0.0", description="Sub-millisecond Deterministic AI Governance Middleware for Enterprise Operations.")
-policy = PolicyManager()
-gate = DeterministicGate(policy)
+app = FastAPI(
+    title="Zero-Data Intent Governance Gateway",
+    version="3.0.0",
+    description="Sub-millisecond Deterministic AI Governance with Active Disambiguation and Chained Cryptographic Audit."
+)
 
-class TransactionPayload(BaseModel):
-    id: Optional[str] = None
-    amount: float
-    vendor: str
-    department: str
-    budget_cleared: bool
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "policies.yaml"
 
-@app.get("/health")
-def health_check(): return {"status": "ACTIVE", "framework": "Zero-Data Intent Architecture"}
+def load_policies():
+    if not CONFIG_PATH.exists():
+        return {
+            "approved_vendors": {
+                "AWS": ["aws", "amazon", "aws_cloud_global"],
+                "Microsoft": ["azure", "microsoft", "azure_enterprise"],
+                "SAP": ["sap", "sap_ariba"],
+                "Oracle": ["oracle", "oracle_cloud"]
+            },
+            "allowed_departments": ["Engineering", "Infrastructure", "Security"],
+            "max_auto_approval_limit": 5000.0
+        }
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-@app.post("/v1/governance/evaluate")
-def evaluate_transaction(payload: TransactionPayload):
-    try: return gate.evaluate(payload.model_dump())
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+policies = load_policies()
+
+# Mخطط صارم يمنع التخمين وحقن الحقول الغريبة (Strict Constrained Model)
+class StrictTransactionPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    id: str = Field(..., min_length=3, max_length=64, description="Unique transaction trace ID")
+    amount: float = Field(..., gt=0.0, description="Exact transaction financial value")
+    vendor: str = Field(..., min_length=2, description="Target vendor identifier")
+    department: str = Field(..., min_length=2, description="Originating corporate department")
+    budget_cleared: bool = Field(..., description="Explicit signoff verification")
+
+@app.get("/health", tags=["System"])
+def health_check():
+    return {
+        "status": "ACTIVE",
+        "version": "3.0.0",
+        "framework": "Zero-Data Intent Architecture",
+        "security_features": [
+            "Strict Constrained Schema",
+            "Active Disambiguation Protocol",
+            "Immutable Cryptographic Hash Chaining"
+        ]
+    }
+
+@app.post("/v1/governance/evaluate", tags=["Governance"])
+def evaluate_transaction(payload: StrictTransactionPayload):
+    try:
+        return evaluate_governance(payload.model_dump(), policies)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

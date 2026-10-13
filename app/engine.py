@@ -1,51 +1,110 @@
-﻿import time, hashlib, json, uuid, yaml
-from typing import Dict, Any, Tuple
+﻿import time
+import json
+import hashlib
 
-class PolicyManager:
-    def __init__(self, config_path: str = "config/policies.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
-        self.rules = self.config.get("rules", {})
-        self.max_auto_budget = self.rules.get("max_auto_approval_usd", 0.0)
-        self.authorized_vendors = set(self.rules.get("authorized_vendors", []))
-        self.authorized_depts = set(self.rules.get("authorized_departments", []))
-        self.aliases = self.config.get("deterministic_mappings", {}).get("vendor_aliases", {})
+class ImmutableAuditLedger:
+    def __init__(self):
+        # Genesis Hash
+        self.last_hash = "0" * 64
 
-    def resolve_alias(self, vendor: str) -> Tuple[str, bool]:
-        if vendor in self.aliases:
-            return self.aliases[vendor], True
-        return vendor, False
-
-class DeterministicGate:
-    def __init__(self, policy: PolicyManager):
-        self.policy = policy
-
-    def evaluate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        start = time.perf_counter()
-        tx_id = payload.get("id", str(uuid.uuid4())[:8])
-        raw_vendor = payload.get("vendor", "")
-        amount = payload.get("amount", 0.0)
-        dept = payload.get("department", "")
-        budget_cleared = payload.get("budget_cleared", False)
-
-        resolved_vendor, was_collapsed = self.policy.resolve_alias(raw_vendor)
-        dof = 0
-        violations = []
-
-        if resolved_vendor not in self.policy.authorized_vendors: dof += 1; violations.append("UNAUTHORIZED_VENDOR")
-        if dept not in self.policy.authorized_depts: dof += 1; violations.append("UNAUTHORIZED_DEPARTMENT")
-        if not budget_cleared: dof += 1; violations.append("BUDGET_NOT_CLEARED")
-        if amount > self.policy.max_auto_budget: dof += 1; violations.append("THRESHOLD_EXCEEDED")
-
-        latency_ms = (time.perf_counter() - start) * 1000
-        action = "EXECUTE_INTENT_LOCKED" if dof == 0 else f"DETERMINISTIC_HALT ({' | '.join(violations)})"
-        status = "APPROVED" if dof == 0 else "HALTED_AWAITING_HUMAN"
-
-        audit_payload = {"tx_id": tx_id, "timestamp": time.time(), "payload": payload, "decision": action, "dof": dof}
-        proof = hashlib.sha256(json.dumps(audit_payload, sort_keys=True).encode()).hexdigest()
-
-        return {
-            "tx_id": tx_id, "status": status, "action": action, "degrees_of_freedom": dof,
-            "state_collapsed": was_collapsed, "resolved_vendor": resolved_vendor, "latency_ms": round(latency_ms, 4),
-            "tokens_consumed": 0, "audit_hash": proof, "hallucination_risk": "0.0%" if dof == 0 else "0.0% (Risk Blocked)"
+    def record_decision(self, tx_id: str, payload: dict, decision: dict) -> str:
+        record = {
+            "tx_id": tx_id,
+            "payload": payload,
+            "decision": decision,
+            "timestamp": time.time(),
+            "previous_hash": self.last_hash
         }
+        serialized = json.dumps(record, sort_keys=True)
+        current_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        self.last_hash = current_hash
+        return current_hash
+
+audit_ledger = ImmutableAuditLedger()
+
+def resolve_vendor(vendor_name: str, approved_vendors: dict) -> str | None:
+    vendor_clean = vendor_name.strip().lower()
+    for official_name, aliases in approved_vendors.items():
+        if vendor_clean == official_name.lower():
+            return official_name
+        for alias in aliases:
+            if alias.lower() in vendor_clean or vendor_clean in alias.lower():
+                return official_name
+    return None
+
+def evaluate_governance(payload: dict, policies: dict) -> dict:
+    start_time = time.perf_counter()
+    violations = []
+    missing_fields = []
+
+    # 1. التحقق من المورد مع تقليص فضاء الحالات (State Collapse)
+    raw_vendor = payload.get("vendor", "")
+    resolved_vendor = resolve_vendor(raw_vendor, policies.get("approved_vendors", {}))
+    if not resolved_vendor:
+        violations.append("UNAUTHORIZED_VENDOR")
+
+    # 2. التحقق من القسم المصرح له
+    department = payload.get("department", "")
+    if department not in policies.get("allowed_departments", []):
+        violations.append("UNAUTHORIZED_DEPARTMENT")
+
+    # 3. التحقق من اعتماد الميزانية (نقص حقل)
+    if not payload.get("budget_cleared", False):
+        missing_fields.append("budget_cleared")
+
+    # 4. التحقق من السقف المالي التلقائي
+    amount = payload.get("amount", 0.0)
+    max_limit = policies.get("max_auto_approval_limit", 5000.0)
+    if amount > max_limit:
+        violations.append("THRESHOLD_EXCEEDED")
+
+    dof = len(violations) + len(missing_fields)
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 4)
+
+    # الركيزة الأولى: Intent Lock (DoF = 0)
+    if dof == 0:
+        decision = {
+            "tx_id": payload.get("id"),
+            "status": "APPROVED",
+            "action": "EXECUTE_INTENT_LOCKED",
+            "degrees_of_freedom": 0,
+            "state_collapsed": True,
+            "resolved_vendor": resolved_vendor,
+            "latency_ms": latency_ms,
+            "tokens_consumed": 0,
+            "hallucination_risk": "0.0%"
+        }
+        decision["audit_hash"] = audit_ledger.record_decision(payload.get("id"), payload, decision)
+        return decision
+
+    # الركيزة التفاعلية: Active Disambiguation (DoF = 1 ناتج عن نقص حقل فقط دون انتهاكات صريحة)
+    if dof == 1 and len(missing_fields) == 1 and len(violations) == 0:
+        field = missing_fields[0]
+        decision = {
+            "tx_id": payload.get("id"),
+            "status": "ACTIVE_DISAMBIGUATION_REQUIRED",
+            "action": "PROMPT_USER_FOR_MISSING_FIELD",
+            "degrees_of_freedom": 1,
+            "required_field": field,
+            "prompt_to_user": f"Transaction ambiguity detected: Please confirm if '{field}' is approved to collapse state to DoF=0.",
+            "latency_ms": latency_ms,
+            "tokens_consumed": 0,
+            "hallucination_risk": "0.0% (Deterministic Probe)"
+        }
+        decision["audit_hash"] = audit_ledger.record_decision(payload.get("id"), payload, decision)
+        return decision
+
+    # الركيزة الثانية: Deterministic Halt (انتهاكات واضحة متعددة DoF > 0)
+    all_reasons = violations + [f"MISSING_{m.upper()}" for m in missing_fields]
+    decision = {
+        "tx_id": payload.get("id"),
+        "status": "HALTED_AWAITING_HUMAN",
+        "action": f"DETERMINISTIC_HALT ({' | '.join(all_reasons)})",
+        "degrees_of_freedom": dof,
+        "state_collapsed": False,
+        "latency_ms": latency_ms,
+        "tokens_consumed": 0,
+        "hallucination_risk": "0.0% (Risk Blocked)"
+    }
+    decision["audit_hash"] = audit_ledger.record_decision(payload.get("id"), payload, decision)
+    return decision
