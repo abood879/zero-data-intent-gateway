@@ -13,7 +13,7 @@ A sub-millisecond line-rate governance middleware designed to enforce determinis
 
 Traditional AI guardrails rely on secondary probabilistic models (LLM-as-a-Judge), compounding latency and failure vectors. The **Zero-Data Intent Architecture** evaluates mission-critical enterprise transactions through dynamic **Degrees of Freedom (DoF)**:
 
-$$DoF = N_{\text{violations}} + N_{\text{missing\_parameters}}$$
+$$DoF = N_{\text{violations}} + N_{\text{missing parameters}}$$
 
 ### The 3 Operational Tiers
 
@@ -29,7 +29,7 @@ $$DoF = N_{\text{violations}} + N_{\text{missing\_parameters}}$$
 
 - **Strict Constrained Schemas**: Enforces `ConfigDict(strict=True, extra="forbid")` via Pydantic to neutralize prompt injections and structural bypass attempts at wire speed.
 - **Cryptographic Audit Ledger**: Each transaction decision is anchored in an immutable SHA-256 hash chain:
-  $$\text{Audit\_Hash}_{i} = \text{SHA256}(\text{Audit\_Hash}_{i-1} \parallel \text{Payload} \parallel \text{Decision} \parallel \text{Timestamp})$$
+  $$\text{Audit Hash}_{i} = \text{SHA256}(\text{Audit Hash}_{i-1} \parallel \text{Payload} \parallel \text{Decision} \parallel \text{Timestamp})$$
 - **Agentic Python SDK**: Direct wrapper (`sdk.py`) providing drop-in integration with LangChain, CrewAI, AutoGen, or custom autonomous pipelines.
 
 ---
@@ -41,3 +41,4 @@ $$DoF = N_{\text{violations}} + N_{\text{missing\_parameters}}$$
 ```bash
 docker build -t zero-data-intent-gateway .
 docker run -p 8080:8080 zero-data-intent-gateway
+
