@@ -1,17 +1,22 @@
-﻿version: "2.0"
-governance_domain: "enterprise_financial_and_cloud_procurement"
-rules:
-  max_auto_approval_usd: 5000.00
-  authorized_vendors:
-    - "AWS"
-    - "Microsoft"
-    - "Oracle"
-    - "SAP"
-  authorized_departments:
-    - "Engineering"
-    - "IT"
-    - "Security"
-deterministic_mappings:
-  vendor_aliases:
-    "AWS_Cloud_Global": "AWS"
-    "MSFT_Azure": "Microsoft"
+﻿approved_vendors:
+  AWS:
+    - "aws"
+    - "amazon"
+    - "aws_cloud_global"
+  Microsoft:
+    - "azure"
+    - "microsoft"
+    - "azure_enterprise"
+  SAP:
+    - "sap"
+    - "sap_ariba"
+  Oracle:
+    - "oracle"
+    - "oracle_cloud"
+
+allowed_departments:
+  - "Engineering"
+  - "Infrastructure"
+  - "Security"
+
+max_auto_approval_limit: 5000.0
