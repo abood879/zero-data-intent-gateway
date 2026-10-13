@@ -1,0 +1,39 @@
+﻿version: '3.8'
+
+services:
+  # 1. البوابة الحتمية
+  gateway:
+    build: .
+    container_name: zero-data-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OPA_URL=http://opa:8181
+    depends_on:
+      - redis
+      - opa
+    restart: unless-stopped
+
+  # 2. السجل التشفيري الذري الموزع
+  redis:
+    image: redis:7-alpine
+    container_name: zero-data-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # 3. محرك السياسات المؤسسي المستقل (OPA Sidecar)
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: zero-data-opa
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./config:/policies
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies/policy.rego"
+    restart: unless-stopped
