@@ -3,6 +3,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=Python&logoColor=white)](https://python.org)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://docker.com)
+[![Enterprise CI Pipeline](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A sub-millisecond line-rate governance middleware designed to enforce deterministic state boundaries over autonomous enterprise AI agents. Eliminates statistical drift, unauthorized tool invocation, and token consumption via mathematically bounded State Collapse.
@@ -11,7 +12,7 @@ A sub-millisecond line-rate governance middleware designed to enforce determinis
 
 ## Architectural Philosophy: Deterministic State Collapse (DoF)
 
-Traditional AI guardrails rely on secondary probabilistic models (LLM-as-a-Judge), compounding latency and failure vectors. The **Zero-Data Intent Architecture** evaluates mission-critical enterprise transactions through dynamic **Degrees of Freedom (DoF)**:
+Traditional AI guardrails rely on secondary probabilistic models (LLM-as-a-Judge), compounding latency, operational cost, and nondeterministic failure vectors. The **Zero-Data Intent Architecture** evaluates mission-critical enterprise transactions through dynamic **Degrees of Freedom (DoF)**:
 
 $$DoF = N_{\text{violations}} + N_{\text{missing parameters}}$$
 
@@ -25,20 +26,34 @@ $$DoF = N_{\text{violations}} + N_{\text{missing parameters}}$$
 
 ---
 
-## Core Security Features
+## Core Security & Enterprise Architecture
 
-- **Strict Constrained Schemas**: Enforces `ConfigDict(strict=True, extra="forbid")` via Pydantic to neutralize prompt injections and structural bypass attempts at wire speed.
-- **Cryptographic Audit Ledger**: Each transaction decision is anchored in an immutable SHA-256 hash chain:
+* **Strict Constrained Schemas**: Enforces `ConfigDict(strict=True, extra="forbid")` via Pydantic to neutralize prompt injections and structural bypass attempts at wire speed.
+* **Distributed Atomic Ledger**: Built with Redis append-only streams and atomic Lua scripts to prevent race conditions across multi-worker clusters. Gracefully falls back to local in-memory hashing for isolated nodes.
+* **Policy-as-Code via OPA**: Integrates with Open Policy Agent (OPA Sidecar) running custom declarative Rego policies (`config/policy.rego`).
+* **Cryptographic Audit Ledger**: Each transaction decision is anchored in an immutable SHA-256 hash chain:
   $$\text{Audit Hash}_{i} = \text{SHA256}(\text{Audit Hash}_{i-1} \parallel \text{Payload} \parallel \text{Decision} \parallel \text{Timestamp})$$
-- **Agentic Python SDK**: Direct wrapper (`sdk.py`) providing drop-in integration with LangChain, CrewAI, AutoGen, or custom autonomous pipelines.
+* **Enterprise Observability**: Real-time Prometheus metrics exporter (`/metrics`) exposing latency histograms and decision counters.
+* **Automated CI/CD Pipeline**: GitHub Actions test automation running complete functional suites and Docker container builds on every commit.
+* **Agentic Python SDK**: Direct wrapper (`sdk.py`) providing drop-in integration with LangChain, CrewAI, AutoGen, or custom autonomous pipelines.
 
 ---
 
-## Quickstart (Local Deployment)
+## System Topology
 
-### 1. Using Docker (Recommended)
-
-```bash
-docker build -t zero-data-intent-gateway .
-docker run -p 8080:8080 zero-data-intent-gateway
-
+```text
+[ Autonomous AI Agent ]
+         │
+         ▼ (HTTP POST / Payload)
+┌────────────────────────────────────────────────────────┐
+│  Zero-Data Intent Governance Gateway (:8080)           │
+│  ├─ Strict Schema Validator (Pydantic / Strict Type)   │
+│  ├─ Deterministic State Engine (DoF Calculation)       │
+│  └─ Prometheus Exporter (/metrics)                     │
+└────────┬──────────────────────────────────────┬────────┘
+         │ (Sidecar Evaluation)                 │ (Audit Append)
+         ▼                                      ▼
+┌──────────────────┐                  ┌──────────────────┐
+│ OPA Engine (:8181│                  │ Redis Ledger     │
+│ (Rego Policies)  │                  │ (:6379 / Atomic) │
+└──────────────────┘                  └──────────────────┘
