@@ -1,6 +1,6 @@
 ﻿# Zero-Data Intent Governance Gateway (v3.0)
 
-[![Tests](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions)
+[![CI](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions)
 [![Release](https://img.shields.io/github/v/release/abood879/zero-data-intent-gateway?color=blue)](https://github.com/abood879/zero-data-intent-gateway/releases/latest)
 [![Tests Passing](https://img.shields.io/badge/tests-18%2F18%20passed-brightgreen)](https://github.com/abood879/zero-data-intent-gateway)
 
