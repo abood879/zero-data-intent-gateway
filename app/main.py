@@ -82,7 +82,7 @@ def health_check():
         "security_features": [
             "Strict Constrained Schema",
             "Active Disambiguation Protocol",
-            "Immutable Cryptographic Hash Chaining",
+            "Tamper-Evident SHA-256 Hash Chaining",
             "Prometheus Enterprise Observability"
         ]
     }
