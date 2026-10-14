@@ -117,4 +117,4 @@ def evaluate_transaction(
     except AuditLedgerUnavailable as e:
         raise HTTPException(status_code=503, detail="Audit ledger unavailable; transaction denied") from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal Engine Failure: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error; transaction denied")
