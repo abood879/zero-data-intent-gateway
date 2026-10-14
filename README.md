@@ -24,6 +24,25 @@ $$DoF = N_{\text{violations}} + N_{\text{missing parameters}}$$
 | **Tier 2** | **Active Disambiguation** | $DoF = 1$ | Intercepts isolated parameter ambiguity (e.g., missing sign-off). Dispatches a targeted probe back to the caller to collapse state to $DoF = 0$ without triggering approval fatigue. | **<0.05 ms** / **0 Tokens** |
 | **Tier 3** | **Deterministic Halt** | $DoF > 1$ | Hard stop on multi-vector policy violations or unauthorized vendors. Records forensic cryptographic state and halts execution. | **<0.05 ms** / **0 Tokens** |
 
+## Empirical Micro-Benchmarks
+
+Reference measurements for the deterministic Tier 1 engine evaluation:
+
+| Metric | Latency |
+| :--- | :--- |
+| Median (p50) | 9.307 µs (0.0093 ms) |
+| Mean | 10.005 µs (0.0100 ms) |
+| 95th percentile (p95) | 11.897 µs (0.0118 ms) |
+| 99th percentile (p99) | 17.112 µs (0.0171 ms) |
+
+Run the benchmark from the repository root with:
+
+```bash
+python -m benchmarks.benchmark
+```
+
+The benchmark measures 1,000 Tier 1 evaluations with audit appends stubbed. Results vary with the execution environment.
+
 ---
 
 ## Core Security & Enterprise Architecture
