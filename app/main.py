@@ -77,7 +77,7 @@ def verify_gateway_token(authorization: str | None = Header(default=None)) -> No
 def health_check():
     return {
         "status": "ACTIVE",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "framework": "Zero-Data Intent Architecture",
         "security_features": [
             "Strict Constrained Schema",
