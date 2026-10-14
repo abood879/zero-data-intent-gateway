@@ -246,3 +246,30 @@ def test_required_audit_ledger_failure_fails_closed(secured_client, monkeypatch)
 
     assert response.status_code == 503
     assert "transaction denied" in response.json()["detail"]
+def test_semantic_bypass_complete_params_blocked():
+    """
+    Adversarial test: Complete schema parameters bypassing authorization boundaries.
+    Ensures that 100% syntactically valid parameters cannot bypass RBAC or financial
+    thresholds, enforcing a deterministic Hard Halt (DoF >= 2).
+    """
+    from app.main import evaluate_dof
+    
+    # 1. Privilege Escalation: Valid parameters with unauthorized role
+    malicious_payload = {
+        "tool": "database_drop",
+        "parameters": {"target_table": "users", "force": True},
+        "context": {"role": "support_agent", "user_id": "agent_007"}
+    }
+    dof, reasons = evaluate_dof(malicious_payload)
+    assert dof >= 2, "Security Breach: Unauthorized tool execution allowed because params were complete!"
+    assert any("unauthorized" in r for r in reasons)
+
+    # 2. Financial Drain Attack: Valid parameters exceeding critical organization threshold
+    financial_drain_payload = {
+        "tool": "wire_transfer",
+        "parameters": {"amount": 50000, "beneficiary": "external_wallet"},
+        "context": {"role": "finance_agent", "max_limit": 5000}
+    }
+    dof_fin, reasons_fin = evaluate_dof(financial_drain_payload)
+    assert dof_fin >= 2, "Security Breach: High-value financial drain allowed because schema was valid!"
+    assert any("exceeds critical threshold" in r for r in reasons_fin)
