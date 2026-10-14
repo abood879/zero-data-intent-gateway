@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import os
 from sdk import protected_tool, SecurityViolationError, IdentitySpoofingError, DisambiguationRequiredError, audit_ledger
 from app.main import app, evaluate_dof
 from fastapi.testclient import TestClient
@@ -19,7 +20,7 @@ def test_e2e_unified_engine_parity_between_sdk_and_api():
         "parameters": {"amount": "50000.00"},
         "context": {"role": "finance_agent", "max_limit": "5000.00"}
     }
-    response = client.post("/v1/evaluate", headers={"Authorization": "Bearer prod-deterministic-token-310"}, json=payload)
+    response = client.post("/v1/evaluate", headers={"Authorization": f"Bearer {os.getenv('GATEWAY_API_TOKEN', 'prod-deterministic-token-310')}"}, json=payload)
     assert response.status_code == 200
     assert response.json()["status"] == "DENIED"
     assert response.json()["dof"] >= 2
