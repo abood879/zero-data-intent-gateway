@@ -3,7 +3,7 @@
 [![CI](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions)
 [![Release](https://img.shields.io/github/v/release/abood879/zero-data-intent-gateway?color=blue)](https://github.com/abood879/zero-data-intent-gateway/releases/latest)
 [![Version](https://img.shields.io/badge/version-v3.1.0-blue.svg)](https://github.com/abood879/zero-data-intent-gateway/releases/tag/v3.1.0)
-[![Tests Passing](https://img.shields.io/badge/tests-18%2F18%20passed-brightgreen)](https://github.com/abood879/zero-data-intent-gateway)
+[![Tests Passing](https://img.shields.io/badge/tests-22%2F22%20passed-brightgreen)](https://github.com/abood879/zero-data-intent-gateway)
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=Python&logoColor=white)](https://python.org)

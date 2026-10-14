@@ -273,3 +273,61 @@ def test_semantic_bypass_complete_params_blocked():
     dof_fin, reasons_fin = evaluate_dof(financial_drain_payload)
     assert dof_fin >= 2, "Security Breach: High-value financial drain allowed because schema was valid!"
     assert any("exceeds critical threshold" in r for r in reasons_fin)
+
+
+def test_protected_tool_decorator_blocks_unauthorized_execution():
+    from sdk import SecurityViolationError, protected_tool
+
+    executed = {"flag": False}
+
+    @protected_tool(tool_name="database_drop")
+    def dangerous_operation(target_table: str):
+        executed["flag"] = True
+        return "SUCCESS"
+
+    with pytest.raises(SecurityViolationError) as exc_info:
+        dangerous_operation(
+            target_table="production_records",
+            __context__={"role": "guest_agent"},
+        )
+
+    assert executed["flag"] is False
+    assert "Execution blocked" in str(exc_info.value)
+
+
+def test_protected_tool_checks_positional_arguments_before_execution():
+    from sdk import SecurityViolationError, protected_tool
+
+    executed = {"flag": False}
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: int):
+        executed["flag"] = True
+        return amount
+
+    with pytest.raises(SecurityViolationError):
+        transfer(
+            50000,
+            __context__={"role": "finance_agent", "max_limit": 50000},
+        )
+
+    assert executed["flag"] is False
+
+
+def test_protected_tool_checks_keyword_expansion_before_execution():
+    from sdk import SecurityViolationError, protected_tool
+
+    executed = {"flag": False}
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(**parameters):
+        executed["flag"] = True
+        return parameters
+
+    with pytest.raises(SecurityViolationError):
+        transfer(
+            amount=50000,
+            __context__={"role": "finance_agent", "max_limit": 50000},
+        )
+
+    assert executed["flag"] is False
