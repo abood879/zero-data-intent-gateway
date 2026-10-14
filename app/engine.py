@@ -4,15 +4,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 class UnifiedGovernanceEngine:
-    """
-    Single Source of Truth for Intent Governance.
-    Unifies Schema, RBAC, Contextual Thresholds, and OPA policies.
-    """
     def __init__(self):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
         self.default_auto_approval = Decimal(os.getenv("GATEWAY_AUTO_APPROVAL_LIMIT", "1000.00"))
         
-        # Centralized RBAC Matrix
         self.tool_permissions = {
             "database_drop": ["superadmin"],
             "admin_execute": ["admin"],
@@ -29,11 +24,9 @@ class UnifiedGovernanceEngine:
         params = payload.get("parameters", {})
         context = payload.get("context", {})
 
-        # 1. Structural Invariant
         if not tool:
             return 2, ["Missing target tool specification"], metadata
 
-        # 2. RBAC Policy Invariant
         role = context.get("role")
         if not role:
             return 2, ["Unauthenticated invocation: Role missing from verified context"], metadata
@@ -44,7 +37,6 @@ class UnifiedGovernanceEngine:
             dof += 2
             return dof, violations, metadata
 
-        # 3. Contextual and Financial Thresholds (Evaluated via strict Decimal)
         if tool == "wire_transfer":
             amount_raw = params.get("amount")
             if amount_raw is None:
