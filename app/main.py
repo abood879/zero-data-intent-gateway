@@ -1,11 +1,12 @@
 ﻿import os
+import hmac
 import yaml
 import time
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 from typing import Dict, Any
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from app.engine import evaluate_governance
+from app.engine import AuditLedgerUnavailable, PolicyEngineUnavailable, evaluate_governance
 
 app = FastAPI(
     title="Zero-Data Intent Governance Gateway",
@@ -45,6 +46,17 @@ def load_policies() -> Dict[str, Any]:
 
 POLICIES = load_policies()
 
+
+def verify_gateway_token(authorization: str | None = Header(default=None)) -> None:
+    expected_token = os.getenv("GATEWAY_API_TOKEN")
+    if expected_token is None:
+        return
+    supplied_token = (authorization or "").encode("utf-8")
+    expected_authorization = f"Bearer {expected_token}".encode("utf-8")
+    if not hmac.compare_digest(supplied_token, expected_authorization):
+        raise HTTPException(status_code=401, detail="Missing or invalid gateway token")
+
+
 @app.get("/health", tags=["System"])
 def health_check():
     return {
@@ -65,7 +77,10 @@ def get_metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/v1/governance/evaluate", tags=["Governance"])
-def evaluate_transaction(payload: StrictTransactionPayload):
+def evaluate_transaction(
+    payload: StrictTransactionPayload,
+    _: None = Depends(verify_gateway_token),
+):
     start = time.perf_counter()
     try:
         raw_dict = payload.model_dump()
@@ -81,5 +96,9 @@ def evaluate_transaction(payload: StrictTransactionPayload):
         ).inc()
         
         return decision
+    except PolicyEngineUnavailable as e:
+        raise HTTPException(status_code=503, detail="Policy engine unavailable; transaction denied") from e
+    except AuditLedgerUnavailable as e:
+        raise HTTPException(status_code=503, detail="Audit ledger unavailable; transaction denied") from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Engine Failure: {str(e)}")

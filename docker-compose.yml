@@ -6,29 +6,31 @@ services:
     build: .
     container_name: zero-data-gateway
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - OPA_URL=http://opa:8181
+      REDIS_URL: redis://redis:6379/0
+      OPA_URL: http://opa:8181
+      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:?Set GATEWAY_API_TOKEN before starting}
     depends_on:
       - redis
       - opa
     restart: unless-stopped
+    networks:
+      - gateway-edge
+      - control-plane
 
   # 2. السجل التشفيري الذري الموزع
   redis:
     image: redis:7-alpine
     container_name: zero-data-redis
-    ports:
-      - "6379:6379"
     restart: unless-stopped
+    networks:
+      - control-plane
 
   # 3. محرك السياسات المؤسسي المستقل (OPA Sidecar)
   opa:
     image: openpolicyagent/opa:latest
     container_name: zero-data-opa
-    ports:
-      - "8181:8181"
     volumes:
       - ./config:/policies
     command:
@@ -37,3 +39,10 @@ services:
       - "--addr=0.0.0.0:8181"
       - "/policies/policy.rego"
     restart: unless-stopped
+    networks:
+      - control-plane
+
+networks:
+  gateway-edge:
+  control-plane:
+    internal: true

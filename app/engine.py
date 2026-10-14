@@ -17,24 +17,42 @@ try:
 except ImportError:
     HTTPX_AVAILABLE = False
 
+
+class PolicyEngineUnavailable(RuntimeError):
+    pass
+
+
+class AuditLedgerUnavailable(RuntimeError):
+    pass
+
+
 class HybridAuditLedger:
-    def __init__(self, redis_url: str = "redis://redis:6379/0"):
+    def __init__(self, redis_url: str | None = None):
         self.redis_client = None
+        self.redis_required = redis_url is not None
         self.chain = []
         self.last_hash = "GENESIS_BLOCK_2026_ZERO_DATA_GATEWAY"
 
-        if REDIS_AVAILABLE:
+        if self.redis_required and REDIS_AVAILABLE:
             try:
-                self.redis_client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1)
+                self.redis_client = redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
                 self.redis_client.ping()
                 if not self.redis_client.exists("audit:last_hash"):
                     self.redis_client.set("audit:last_hash", self.last_hash)
             except Exception:
-                self.redis_client = None  # التراجع للذاكرة المحلية في حال عدم توفر Redis
+                self.redis_client = None
 
     def append_record(self, tx_id: str, payload: Dict[str, Any], decision: str) -> str:
         timestamp = str(time.time())
         serialized_payload = json.dumps(payload, sort_keys=True)
+
+        if self.redis_required and self.redis_client is None:
+            raise AuditLedgerUnavailable("Required Redis audit ledger is unavailable")
 
         if self.redis_client:
             lua_script = """
@@ -51,7 +69,12 @@ class HybridAuditLedger:
             }))
             return new_h
             """
-            return self.redis_client.eval(lua_script, 0, serialized_payload, tx_id, timestamp, decision)
+            try:
+                return self.redis_client.eval(lua_script, 0, serialized_payload, tx_id, timestamp, decision)
+            except Exception as exc:
+                if self.redis_required:
+                    raise AuditLedgerUnavailable("Required Redis audit ledger is unavailable") from exc
+                raise
 
         # Fallback محلي في الذاكرة
         raw_data = f"{self.last_hash}{serialized_payload}{decision}{timestamp}".encode("utf-8")
@@ -67,52 +90,75 @@ class HybridAuditLedger:
         return current_hash
 
 # تهيئة السجل
-ledger = HybridAuditLedger(redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+ledger = HybridAuditLedger(redis_url=os.getenv("REDIS_URL"))
 
 def evaluate_governance(payload: Dict[str, Any], policies: Dict[str, Any]) -> Dict[str, Any]:
     start_time = time.perf_counter()
     tx_id = payload.get("id", "UNKNOWN")
     opa_url = os.getenv("OPA_URL")
 
-    # 1. التقييم المؤسسي عبر OPA Sidecar إن وُجد
-    if opa_url and HTTPX_AVAILABLE:
+    # A configured OPA is authoritative; never fall back when it is unavailable.
+    if opa_url:
+        if not HTTPX_AVAILABLE:
+            raise PolicyEngineUnavailable("OPA is configured but httpx is unavailable")
         try:
             with httpx.Client(timeout=0.5) as client:
                 res = client.post(f"{opa_url}/v1/data/governance/intent", json={"input": payload})
-                if res.status_code == 200:
-                    result = res.json().get("result", {})
-                    if result.get("allow"):
-                        latency = (time.perf_counter() - start_time) * 1000
-                        audit_hash = ledger.append_record(tx_id, payload, "INTENT_LOCKED_OPA")
-                        return {
-                            "tx_id": tx_id,
-                            "status": "INTENT_LOCKED",
-                            "action": "EXECUTE_IMMEDIATELY",
-                            "degrees_of_freedom": 0,
-                            "latency_ms": round(latency, 4),
-                            "tokens_consumed": 0,
-                            "hallucination_risk": "0.0%",
-                            "audit_hash": audit_hash,
-                            "engine_source": "Open Policy Agent (Sidecar)"
-                        }
-                    elif result.get("disambiguation_required"):
-                        latency = (time.perf_counter() - start_time) * 1000
-                        audit_hash = ledger.append_record(tx_id, payload, "DISAMBIGUATION_REQUIRED_OPA")
-                        return {
-                            "tx_id": tx_id,
-                            "status": "ACTIVE_DISAMBIGUATION_REQUIRED",
-                            "action": "PROMPT_USER_FOR_MISSING_FIELD",
-                            "degrees_of_freedom": 1,
-                            "required_field": "budget_cleared",
-                            "prompt_to_user": "Please confirm 'budget_cleared' approval to collapse state to DoF=0.",
-                            "latency_ms": round(latency, 4),
-                            "tokens_consumed": 0,
-                            "hallucination_risk": "0.0% (Deterministic Probe)",
-                            "audit_hash": audit_hash,
-                            "engine_source": "Open Policy Agent (Sidecar)"
-                        }
-        except Exception:
-            pass  # في حال تعثر OPA يتم الانتقال للمحرك الحتمي الداخلي
+                if res.status_code != 200:
+                    raise PolicyEngineUnavailable(f"OPA returned HTTP {res.status_code}")
+                result = res.json().get("result")
+        except PolicyEngineUnavailable:
+            raise
+        except Exception as exc:
+            raise PolicyEngineUnavailable("Configured OPA policy engine is unavailable") from exc
+
+        if not isinstance(result, dict):
+            result = {}
+        if result.get("allow") is True:
+            latency = (time.perf_counter() - start_time) * 1000
+            audit_hash = ledger.append_record(tx_id, payload, "INTENT_LOCKED_OPA")
+            return {
+                "tx_id": tx_id,
+                "status": "INTENT_LOCKED",
+                "action": "EXECUTE_IMMEDIATELY",
+                "degrees_of_freedom": 0,
+                "latency_ms": round(latency, 4),
+                "tokens_consumed": 0,
+                "hallucination_risk": "0.0%",
+                "audit_hash": audit_hash,
+                "engine_source": "Open Policy Agent (Sidecar)"
+            }
+        if result.get("disambiguation_required") is True:
+            latency = (time.perf_counter() - start_time) * 1000
+            audit_hash = ledger.append_record(tx_id, payload, "DISAMBIGUATION_REQUIRED_OPA")
+            return {
+                "tx_id": tx_id,
+                "status": "ACTIVE_DISAMBIGUATION_REQUIRED",
+                "action": "PROMPT_USER_FOR_MISSING_FIELD",
+                "degrees_of_freedom": 1,
+                "required_field": "budget_cleared",
+                "prompt_to_user": "Please confirm 'budget_cleared' approval to collapse state to DoF=0.",
+                "latency_ms": round(latency, 4),
+                "tokens_consumed": 0,
+                "hallucination_risk": "0.0% (Deterministic Probe)",
+                "audit_hash": audit_hash,
+                "engine_source": "Open Policy Agent (Sidecar)"
+            }
+
+        latency = (time.perf_counter() - start_time) * 1000
+        audit_hash = ledger.append_record(tx_id, payload, "POLICY_DENIED_OPA")
+        return {
+            "tx_id": tx_id,
+            "status": "HALTED_POLICY_DENIED",
+            "action": "DENY_BY_DEFAULT",
+            "degrees_of_freedom": None,
+            "state_collapsed": False,
+            "latency_ms": round(latency, 4),
+            "tokens_consumed": 0,
+            "hallucination_risk": "0.0% (Risk Blocked)",
+            "audit_hash": audit_hash,
+            "engine_source": "Open Policy Agent (Sidecar)"
+        }
 
     # 2. التقييم الداخلي الحتمي (Deterministic Policy Engine)
     violations = []
