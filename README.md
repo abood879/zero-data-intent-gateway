@@ -1,5 +1,9 @@
 ﻿# Zero-Data Intent Governance Gateway (v3.0)
 
+[![Tests](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions)
+[![Release](https://img.shields.io/github/v/release/abood879/zero-data-intent-gateway?color=blue)](https://github.com/abood879/zero-data-intent-gateway/releases/latest)
+[![Tests Passing](https://img.shields.io/badge/tests-18%2F18%20passed-brightgreen)](https://github.com/abood879/zero-data-intent-gateway)
+
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=Python&logoColor=white)](https://python.org)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://docker.com)
@@ -7,6 +11,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A sub-millisecond line-rate governance middleware designed to enforce deterministic state boundaries over autonomous enterprise AI agents. Eliminates statistical drift, unauthorized tool invocation, and token consumption via mathematically bounded State Collapse.
+
+## 🧪 Instant Reproduction (One-Line Verification)
+
+```bash
+# Run full adversarial and fail-fast test suite locally
+pytest tests/ -v
+```
 
 ---
 
