@@ -29,7 +29,7 @@ These guarantees are covered by `tests/test_adversarial.py`, including the OPA o
 
 - **Zero LLM ingestion:** transaction evaluation does not call or forward data to an LLM.
 - **Ephemeral in-memory processing:** the gateway evaluates the validated request in process memory; it does not persist the raw request payload in its audit record. This is not a claim of secure memory erasure, and upstream proxies or caller systems must be configured not to retain request bodies.
-- **Hashed state auditing:** audit entries link a transaction identifier, decision, timestamp, and digest to the previous digest. The payload contributes to the digest but is not stored in the audit entry. The in-memory implementation uses SHA-256; the current Redis Lua implementation uses Redis `sha1hex`. The chain is not tamper-proof against an administrator who can rewrite Redis and is not a substitute for externally protected, append-only retention.
+- **Hashed state auditing:** both memory and Redis store the same hash-chain envelope. The payload itself is not retained; only its SHA-256 digest is included. The envelope contains `tx_id`, `prev_hash`, `payload_hash`, `decision`, and `timestamp`. Each field is serialized as canonical JSON (`sort_keys=true`, compact separators, UTF-8), and `hash` is the lowercase hexadecimal SHA-256 of that JSON. Verification starts with `GENESIS_BLOCK_2026_ZERO_DATA_GATEWAY` and checks each previous-hash link and envelope digest. This detects record edits that do not also replace the subsequent chain, but is not tamper-proof against an administrator who can rewrite and recompute Redis records; use externally protected, append-only retention for that threat.
 
 ## Bypass Prevention: Token Injection & Network Isolation
 

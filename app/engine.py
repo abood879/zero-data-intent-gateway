@@ -1,14 +1,16 @@
 ﻿import hashlib
+import hmac
 import json
 import time
 import os
-from typing import Dict, Any
+from typing import Any, Dict, Iterable
 
 # التحقق من وجود مكتبات الاتصال الموزع
 try:
     import redis
     REDIS_AVAILABLE = True
 except ImportError:
+    redis = None
     REDIS_AVAILABLE = False
 
 try:
@@ -26,12 +28,68 @@ class AuditLedgerUnavailable(RuntimeError):
     pass
 
 
+GENESIS_HASH = "GENESIS_BLOCK_2026_ZERO_DATA_GATEWAY"
+
+
+def _canonical_json(value: Dict[str, Any]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _build_audit_entry(
+    tx_id: str,
+    previous_hash: str,
+    payload: Dict[str, Any],
+    decision: str,
+    timestamp: str,
+) -> Dict[str, str]:
+    envelope = {
+        "tx_id": tx_id,
+        "prev_hash": previous_hash,
+        "payload_hash": hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest(),
+        "decision": decision,
+        "timestamp": timestamp,
+    }
+    return {
+        **envelope,
+        "hash": hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest(),
+    }
+
+
+def verify_audit_chain(records: Iterable[Dict[str, str]]) -> bool:
+    previous_hash = GENESIS_HASH
+    for record in records:
+        if set(record) != {
+            "tx_id",
+            "prev_hash",
+            "payload_hash",
+            "decision",
+            "timestamp",
+            "hash",
+        }:
+            return False
+        if record.get("prev_hash") != previous_hash:
+            return False
+        envelope = {
+            key: record.get(key)
+            for key in ("tx_id", "prev_hash", "payload_hash", "decision", "timestamp")
+        }
+        if not all(isinstance(value, str) for value in envelope.values()):
+            return False
+        expected_hash = hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+        if not isinstance(record.get("hash"), str) or not hmac.compare_digest(
+            record["hash"], expected_hash
+        ):
+            return False
+        previous_hash = expected_hash
+    return True
+
+
 class HybridAuditLedger:
     def __init__(self, redis_url: str | None = None):
         self.redis_client = None
         self.redis_required = redis_url is not None
         self.chain = []
-        self.last_hash = "GENESIS_BLOCK_2026_ZERO_DATA_GATEWAY"
+        self.last_hash = GENESIS_HASH
 
         if self.redis_required and REDIS_AVAILABLE:
             try:
@@ -42,52 +100,46 @@ class HybridAuditLedger:
                     socket_timeout=1,
                 )
                 self.redis_client.ping()
-                if not self.redis_client.exists("audit:last_hash"):
-                    self.redis_client.set("audit:last_hash", self.last_hash)
+                self.redis_client.setnx("audit:last_hash", self.last_hash)
             except Exception:
                 self.redis_client = None
 
     def append_record(self, tx_id: str, payload: Dict[str, Any], decision: str) -> str:
         timestamp = str(time.time())
-        serialized_payload = json.dumps(payload, sort_keys=True)
 
         if self.redis_required and self.redis_client is None:
             raise AuditLedgerUnavailable("Required Redis audit ledger is unavailable")
 
         if self.redis_client:
-            lua_script = """
-            local last = redis.call('GET', 'audit:last_hash')
-            local raw = last .. ARGV[1] .. ARGV[2] .. ARGV[3]
-            local new_h = redis.sha1hex(raw)
-            redis.call('SET', 'audit:last_hash', new_h)
-            redis.call('RPUSH', 'audit:chain', cjson.encode({
-                tx_id = ARGV[2],
-                prev_hash = last,
-                hash = new_h,
-                timestamp = ARGV[3],
-                decision = ARGV[4]
-            }))
-            return new_h
-            """
-            try:
-                return self.redis_client.eval(lua_script, 0, serialized_payload, tx_id, timestamp, decision)
-            except Exception as exc:
-                if self.redis_required:
-                    raise AuditLedgerUnavailable("Required Redis audit ledger is unavailable") from exc
-                raise
+            for _ in range(5):
+                try:
+                    with self.redis_client.pipeline() as pipeline:
+                        pipeline.watch("audit:last_hash")
+                        previous_hash = pipeline.get("audit:last_hash")
+                        if not previous_hash:
+                            raise AuditLedgerUnavailable("Redis audit chain has no head hash")
+                        entry = _build_audit_entry(
+                            tx_id, previous_hash, payload, decision, timestamp
+                        )
+                        pipeline.multi()
+                        pipeline.set("audit:last_hash", entry["hash"])
+                        pipeline.rpush("audit:chain", _canonical_json(entry))
+                        pipeline.execute()
+                        return entry["hash"]
+                except redis.WatchError:
+                    continue
+                except AuditLedgerUnavailable:
+                    raise
+                except Exception as exc:
+                    if self.redis_required:
+                        raise AuditLedgerUnavailable("Required Redis audit ledger is unavailable") from exc
+                    raise
+            raise AuditLedgerUnavailable("Redis audit chain update contention exceeded retries")
 
-        # Fallback محلي في الذاكرة
-        raw_data = f"{self.last_hash}{serialized_payload}{decision}{timestamp}".encode("utf-8")
-        current_hash = hashlib.sha256(raw_data).hexdigest()
-        self.chain.append({
-            "tx_id": tx_id,
-            "prev_hash": self.last_hash,
-            "hash": current_hash,
-            "timestamp": timestamp,
-            "decision": decision
-        })
-        self.last_hash = current_hash
-        return current_hash
+        entry = _build_audit_entry(tx_id, self.last_hash, payload, decision, timestamp)
+        self.chain.append(entry)
+        self.last_hash = entry["hash"]
+        return entry["hash"]
 
 # تهيئة السجل
 ledger = HybridAuditLedger(redis_url=os.getenv("REDIS_URL"))

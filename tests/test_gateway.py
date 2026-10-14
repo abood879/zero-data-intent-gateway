@@ -3,6 +3,12 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 client = TestClient(app)
+AUTH_HEADERS = {"Authorization": "Bearer test-gateway-token"}
+
+
+@pytest.fixture(autouse=True)
+def configure_gateway_token(monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_TOKEN", "test-gateway-token")
 
 def test_health_endpoint():
     response = client.get("/health")
@@ -17,7 +23,7 @@ def test_tier1_intent_lock_dof0():
         "department": "Engineering",
         "budget_cleared": True
     }
-    response = client.post("/v1/governance/evaluate", json=payload)
+    response = client.post("/v1/governance/evaluate", headers=AUTH_HEADERS, json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "INTENT_LOCKED"
@@ -33,7 +39,7 @@ def test_tier2_active_disambiguation_dof1():
         "department": "Engineering",
         "budget_cleared": False
     }
-    response = client.post("/v1/governance/evaluate", json=payload)
+    response = client.post("/v1/governance/evaluate", headers=AUTH_HEADERS, json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ACTIVE_DISAMBIGUATION_REQUIRED"
@@ -48,7 +54,7 @@ def test_tier3_deterministic_halt_dof_gt1():
         "department": "UnknownDept",
         "budget_cleared": False
     }
-    response = client.post("/v1/governance/evaluate", json=payload)
+    response = client.post("/v1/governance/evaluate", headers=AUTH_HEADERS, json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "HALTED_ARRESTING_HAZARD"
@@ -64,7 +70,7 @@ def test_strict_schema_rejection_extra_field():
         "budget_cleared": True,
         "admin_override": True  # حقل دخيل محظور
     }
-    response = client.post("/v1/governance/evaluate", json=payload)
+    response = client.post("/v1/governance/evaluate", headers=AUTH_HEADERS, json=payload)
     assert response.status_code == 422  # Unprocessable Entity via Pydantic
 
 def test_prometheus_metrics_endpoint():

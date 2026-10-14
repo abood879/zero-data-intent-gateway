@@ -49,12 +49,18 @@ POLICIES = load_policies()
 
 def verify_gateway_token(authorization: str | None = Header(default=None)) -> None:
     expected_token = os.getenv("GATEWAY_API_TOKEN")
-    if expected_token is None:
-        return
+    if not expected_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized or Missing Gateway Token",
+        )
     supplied_token = (authorization or "").encode("utf-8")
     expected_authorization = f"Bearer {expected_token}".encode("utf-8")
     if not hmac.compare_digest(supplied_token, expected_authorization):
-        raise HTTPException(status_code=401, detail="Missing or invalid gateway token")
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized or Missing Gateway Token",
+        )
 
 
 @app.get("/health", tags=["System"])

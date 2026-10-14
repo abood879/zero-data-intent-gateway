@@ -57,9 +57,22 @@ def test_financial_boundary_tampering_collapses_to_dof_above_one(secured_client)
     assert decision["degrees_of_freedom"] > 1
 
 
-@pytest.mark.parametrize("authorization", [None, "Bearer wrong-token"])
-def test_missing_or_invalid_gateway_token_is_rejected(secured_client, authorization):
+@pytest.mark.parametrize(
+    ("configured_token", "authorization"),
+    [
+        (None, None),
+        ("test-gateway-token", None),
+        ("test-gateway-token", "Bearer wrong-token"),
+    ],
+)
+def test_unauthorized_access_rejected(
+    secured_client, monkeypatch, configured_token, authorization
+):
     client, _headers = secured_client
+    if configured_token is None:
+        monkeypatch.delenv("GATEWAY_API_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GATEWAY_API_TOKEN", configured_token)
     headers = {} if authorization is None else {"Authorization": authorization}
     response = client.post(
         "/v1/governance/evaluate",
@@ -74,6 +87,26 @@ def test_missing_or_invalid_gateway_token_is_rejected(secured_client, authorizat
     )
 
     assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized or Missing Gateway Token"
+
+
+def test_sha256_audit_chain_tamper_detection():
+    ledger = engine.HybridAuditLedger()
+    ledger.append_record("TX-AUDIT-1", {"amount": 1200.0}, "INTENT_LOCKED")
+    ledger.append_record("TX-AUDIT-2", {"amount": 700.0}, "HALTED_ARRESTING_HAZARD")
+
+    assert all(len(record["hash"]) == 64 for record in ledger.chain)
+    assert engine.verify_audit_chain(ledger.chain)
+
+    tampered_chain = [dict(record) for record in ledger.chain]
+    tampered_chain[0]["decision"] = "TAMPERED_DECISION"
+
+    assert not engine.verify_audit_chain(tampered_chain)
+
+    extra_field_chain = [dict(record) for record in ledger.chain]
+    extra_field_chain[0]["unhashed_metadata"] = "tampered"
+
+    assert not engine.verify_audit_chain(extra_field_chain)
 
 
 def test_sdk_injects_token_and_runs_tool_only_after_gateway_allow(monkeypatch):
