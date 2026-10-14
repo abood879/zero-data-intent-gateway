@@ -88,6 +88,18 @@ def test_application_startup_fails_without_gateway_token(monkeypatch):
             pass
 
 
+def test_boot_fails_without_api_token(monkeypatch):
+    monkeypatch.delenv("GATEWAY_API_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError) as error:
+        with TestClient(app):
+            pass
+
+    assert str(error.value) == (
+        "CRITICAL STARTUP FAILURE: GATEWAY_API_TOKEN is mandatory."
+    )
+
+
 def test_sha256_audit_chain_tamper_detection():
     ledger = engine.HybridAuditLedger()
     ledger.append_record("TX-AUDIT-1", {"amount": 1200.0}, "INTENT_LOCKED")
