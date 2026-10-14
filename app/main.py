@@ -3,6 +3,53 @@ import hmac
 import yaml
 import time
 from contextlib import asynccontextmanager
+
+def evaluate_dof(payload: dict) -> tuple[int, list[str]]:
+    dof = 0
+    reasons = []
+    
+    # 1. Structural / Schema Check
+    tool = payload.get("tool")
+    params = payload.get("parameters", {})
+    context = payload.get("context", {})
+    
+    if not tool:
+        dof += 2
+        reasons.append("Missing target tool definition")
+        return dof, reasons
+
+    # 2. RBAC Policy Check
+    caller_role = context.get("role", "guest")
+    restricted_tools = {
+        "admin_execute": ["admin"],
+        "database_drop": ["superadmin"],
+        "wire_transfer": ["finance_agent", "admin"]
+    }
+    
+    if tool in restricted_tools and caller_role not in restricted_tools[tool]:
+        dof += 2
+        reasons.append(f"Role '{caller_role}' unauthorized for tool '{tool}'")
+        return dof, reasons
+
+    # 3. Contextual / Financial Threshold Check
+    if tool == "wire_transfer":
+        amount = params.get("amount", 0)
+        max_limit = context.get("max_limit", 1000)
+        
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            dof += 2
+            reasons.append("Invalid transfer amount")
+        elif amount > 10000:
+            # تجاوز السقف الحرج للمؤسسة -> Hard Halt
+            dof += 2
+            reasons.append(f"Amount {amount} exceeds critical threshold (10,000)")
+        elif amount > max_limit:
+            # يحتاج تأكيد بشري Step-up / HITL -> DoF = 1
+            dof += 1
+            reasons.append(f"Amount {amount} exceeds role limit {max_limit}; requires Human-In-The-Loop approval")
+
+    return dof, reasons
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 from typing import Dict, Any
