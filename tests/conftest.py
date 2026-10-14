@@ -7,3 +7,8 @@ os.environ["AUDIT_LEDGER_PATH"] = os.path.join(
     tempfile.gettempdir(),
     f"zero-data-gateway-tests-{os.getpid()}.jsonl",
 )
+os.environ["STEP_UP_NONCE_DB_PATH"] = os.path.join(
+    tempfile.gettempdir(),
+    f"zero-data-gateway-nonces-{os.getpid()}.sqlite3",
+)
+os.environ.pop("REDIS_URL", None)

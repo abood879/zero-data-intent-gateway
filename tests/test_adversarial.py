@@ -1,8 +1,9 @@
 import asyncio
 import hashlib
 import json
+import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +23,10 @@ from sdk import (
 
 client = TestClient(app)
 TEST_TOKEN = "adversarial-test-token"
+
+
+def _consume_nonce_in_process(path: str, nonce: str, expires_at: float) -> bool:
+    return sdk.StepUpNonceStore(path).consume(nonce, expires_at)
 
 
 def trusted_context(role: str, user_id: str = "test-user") -> dict[str, str]:
@@ -268,6 +273,134 @@ def test_max_allowed_dof_does_not_bypass_financial_step_up():
         == "TRANSFERRED"
     )
     assert audit_ledger.chain[-2]["decision"] == "STEP_UP_APPROVED"
+
+
+def test_step_up_nonce_is_persistent_across_store_instances(tmp_path, monkeypatch):
+    store_path = tmp_path / "step-up-nonces.sqlite3"
+    store = sdk.StepUpNonceStore(store_path)
+    monkeypatch.setattr(sdk, "step_up_nonce_store", store)
+    identity = {"role": "finance_agent", "user_id": "persistent-user"}
+    token = gateway_main._issue_step_up_approval_token(
+        tool="wire_transfer",
+        parameters={"amount": "6000.00"},
+        identity=identity,
+        expires_at=time.time() + 60,
+    )
+
+    assert sdk.verify_step_up_approval_token(
+        token,
+        tool="wire_transfer",
+        parameters={"amount": "6000.00"},
+        identity=identity,
+    )
+
+    reopened_store = sdk.StepUpNonceStore(store_path)
+    monkeypatch.setattr(sdk, "step_up_nonce_store", reopened_store)
+    assert not sdk.verify_step_up_approval_token(
+        token,
+        tool="wire_transfer",
+        parameters={"amount": "6000.00"},
+        identity=identity,
+    )
+
+
+def test_step_up_nonce_is_atomic_across_processes(tmp_path):
+    store_path = tmp_path / "shared-step-up-nonces.sqlite3"
+    sdk.StepUpNonceStore(store_path)
+    expires_at = time.time() + 60
+    process_context = multiprocessing.get_context("spawn")
+
+    with ProcessPoolExecutor(
+        max_workers=4,
+        mp_context=process_context,
+    ) as executor:
+        results = list(
+            executor.map(
+                _consume_nonce_in_process,
+                [str(store_path)] * 4,
+                ["one-time-approval"] * 4,
+                [expires_at] * 4,
+            )
+        )
+
+    assert results.count(True) == 1
+    assert results.count(False) == 3
+
+
+def test_configured_redis_nonce_store_uses_atomic_set_nx(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeRedis:
+        def set(self, key, value, *, nx, ex):
+            calls.append((key, value, nx, ex))
+            return True
+
+    monkeypatch.setenv("REDIS_URL", "redis://nonce-store.test/0")
+    monkeypatch.setattr(
+        sdk.redis.Redis,
+        "from_url",
+        staticmethod(lambda _url, **_kwargs: FakeRedis()),
+    )
+    database_path = tmp_path / "must-not-fall-back.sqlite3"
+    store = sdk.StepUpNonceStore(database_path)
+
+    assert store.consume("redis-backed-nonce", time.time() + 60)
+    assert len(calls) == 1
+    assert calls[0][1] == "consumed"
+    assert calls[0][2] is True
+    assert calls[0][0].startswith("zero-data-gateway:step-up-nonce:")
+    assert calls[0][3] >= 1
+    assert not database_path.exists()
+
+
+def test_configured_redis_failure_does_not_fall_back_to_sqlite(
+    tmp_path, monkeypatch
+):
+    class UnavailableRedis:
+        def set(self, *_args, **_kwargs):
+            raise sdk.redis.RedisError("Redis unavailable")
+
+    monkeypatch.setenv("REDIS_URL", "redis://nonce-store.test/0")
+    monkeypatch.setattr(
+        sdk.redis.Redis,
+        "from_url",
+        staticmethod(lambda _url, **_kwargs: UnavailableRedis()),
+    )
+    database_path = tmp_path / "must-not-fall-back.sqlite3"
+    store = sdk.StepUpNonceStore(database_path)
+
+    with pytest.raises(sdk.AuditLedgerError, match="Redis"):
+        store.consume("redis-backed-nonce", time.time() + 60)
+
+    assert not database_path.exists()
+
+
+def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
+    from sdk import AuditLedgerError
+
+    identity = {"role": "finance_agent", "user_id": "finance-user"}
+    token = gateway_main._issue_step_up_approval_token(
+        tool="wire_transfer",
+        parameters={"amount": "6000.00"},
+        identity=identity,
+        expires_at=time.time() + 60,
+    )
+
+    def unavailable_store(_nonce, _expires_at):
+        raise AuditLedgerError("nonce store unavailable")
+
+    monkeypatch.setattr(sdk.step_up_nonce_store, "consume", unavailable_store)
+
+    @protected_tool(tool_name="wire_transfer", max_allowed_dof=1)
+    def transfer(amount: str):
+        pytest.fail("Execution must not proceed if nonce consumption fails.")
+
+    with pytest.raises(AuditLedgerError, match="nonce store unavailable"):
+        transfer(
+            amount="6000.00",
+            __context__=gateway_main._issue_trusted_context(identity),
+            step_up_approval_token=token,
+        )
 
 
 def test_max_allowed_dof_cannot_bypass_security_invariants():

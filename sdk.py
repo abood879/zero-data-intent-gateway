@@ -3,11 +3,15 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+import redis
 
 from app.engine import governance_engine
 
@@ -92,8 +96,102 @@ def _parameters_digest(parameters: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(parameters)).hexdigest()
 
 
-_used_step_up_nonces: dict[str, float] = {}
-_step_up_nonce_lock = threading.Lock()
+class StepUpNonceStore:
+    """Atomically consume one-time approval nonces using shared durable storage."""
+
+    def __init__(self, path: str | Path | None = None):
+        self.redis_url = os.getenv("REDIS_URL")
+        self.path = Path(
+            path
+            or os.getenv(
+                "STEP_UP_NONCE_DB_PATH",
+                "step_up_nonces.sqlite3",
+            )
+        )
+        self._redis_client = (
+            redis.Redis.from_url(
+                self.redis_url,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+            if self.redis_url
+            else None
+        )
+        if self._redis_client is None:
+            self._initialize_sqlite()
+
+    def _initialize_sqlite(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(self.path, timeout=10) as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS consumed_step_up_nonces (
+                        nonce_hash TEXT PRIMARY KEY,
+                        expires_at REAL NOT NULL
+                    )
+                    """
+                )
+        except sqlite3.Error as exc:
+            raise AuditLedgerError(
+                f"Could not initialize durable step-up nonce store at {self.path}."
+            ) from exc
+
+    def consume(self, nonce: str, expires_at: float) -> bool:
+        if expires_at <= time.time():
+            return False
+        nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+        if self._redis_client is not None:
+            ttl_seconds = max(1, math.ceil(expires_at - time.time()))
+            try:
+                return bool(
+                    self._redis_client.set(
+                        f"zero-data-gateway:step-up-nonce:{nonce_hash}",
+                        "consumed",
+                        nx=True,
+                        ex=ttl_seconds,
+                    )
+                )
+            except redis.RedisError as exc:
+                raise AuditLedgerError(
+                    "Could not atomically consume step-up approval nonce in Redis."
+                ) from exc
+
+        try:
+            with sqlite3.connect(
+                self.path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM consumed_step_up_nonces WHERE expires_at <= ?",
+                    (time.time(),),
+                )
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO consumed_step_up_nonces (nonce_hash, expires_at)
+                        VALUES (?, ?)
+                        """,
+                        (nonce_hash, expires_at),
+                    )
+                except sqlite3.IntegrityError:
+                    connection.rollback()
+                    return False
+                connection.commit()
+                return True
+        except sqlite3.Error as exc:
+            raise AuditLedgerError(
+                "Could not atomically consume step-up approval nonce in SQLite."
+            ) from exc
+
+
+step_up_nonce_store = StepUpNonceStore()
 
 
 def verify_step_up_approval_token(
@@ -129,6 +227,7 @@ def verify_step_up_approval_token(
         or not nonce
         or isinstance(expiry, bool)
         or not isinstance(expiry, (int, float))
+        or not math.isfinite(expiry)
         or expiry <= time.time()
         or token.get("tool") != tool
         or token.get("params_digest") != _parameters_digest(parameters)
@@ -149,18 +248,7 @@ def verify_step_up_approval_token(
     except (TypeError, ValueError, IdentitySpoofingError):
         return False
 
-    with _step_up_nonce_lock:
-        expired_nonces = [
-            used_nonce
-            for used_nonce, nonce_expiry in _used_step_up_nonces.items()
-            if nonce_expiry <= time.time()
-        ]
-        for used_nonce in expired_nonces:
-            del _used_step_up_nonces[used_nonce]
-        if nonce in _used_step_up_nonces:
-            return False
-        _used_step_up_nonces[nonce] = float(expiry)
-    return True
+    return step_up_nonce_store.consume(nonce, float(expiry))
 
 
 class AuditLedger:
