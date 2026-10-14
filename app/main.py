@@ -2,6 +2,7 @@ import hmac
 import hashlib
 import json
 import os
+import secrets
 import threading
 import time
 from fastapi import Depends, FastAPI, HTTPException, Response, Security
@@ -94,6 +95,67 @@ class LegacyGovernanceRequest(BaseModel):
 def evaluate_dof(payload: dict) -> tuple[int, list[str]]:
     dof, violations, _ = governance_engine.evaluate(payload)
     return dof, violations
+
+
+def _context_hmac_secret() -> bytes:
+    secret = os.getenv("GATEWAY_CONTEXT_HMAC_SECRET")
+    if not secret:
+        raise RuntimeError("GATEWAY_CONTEXT_HMAC_SECRET must be configured.")
+    return secret.encode("utf-8")
+
+
+def _issue_trusted_context(identity: dict[str, str]) -> dict[str, str]:
+    signed_identity = dict(identity)
+    canonical_identity = json.dumps(
+        signed_identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    signed_identity["__signature__"] = hmac.new(
+        _context_hmac_secret(), canonical_identity, hashlib.sha256
+    ).hexdigest()
+    return signed_identity
+
+
+def _issue_step_up_approval_token(
+    *,
+    tool: str,
+    parameters: dict,
+    identity: dict[str, str],
+    expires_at: float,
+) -> dict[str, str | float]:
+    params_digest = hashlib.sha256(
+        json.dumps(
+            parameters,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    claims: dict[str, str | float] = {
+        "tool": tool,
+        "params_digest": params_digest,
+        "role": identity["role"],
+        "user_id": identity["user_id"],
+        "expires_at": expires_at,
+        "nonce": secrets.token_urlsafe(24),
+    }
+    signature = hmac.new(
+        _context_hmac_secret(),
+        b"step-up-approval:v1:"
+        + json.dumps(
+            claims,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {**claims, "signature": signature}
 
 def record_legacy_audit(payload: dict, status: str) -> str:
     global _legacy_audit_hash

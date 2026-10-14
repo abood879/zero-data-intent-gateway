@@ -11,6 +11,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       OPA_URL: http://opa:8181
       TOKEN_IDENTITY_MAP: ${TOKEN_IDENTITY_MAP:?Set TOKEN_IDENTITY_MAP before starting}
+      GATEWAY_CONTEXT_HMAC_SECRET: ${GATEWAY_CONTEXT_HMAC_SECRET:?Set GATEWAY_CONTEXT_HMAC_SECRET before starting}
     depends_on:
       - redis
       - opa

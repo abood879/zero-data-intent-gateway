@@ -19,13 +19,15 @@ The engine rejects tools absent from `tool_permissions`. Tool permissions and th
 
 ## SDK Context Integrity
 
-The SDK's `sign_context` and `verify_context` use canonical JSON and HMAC-SHA256. Configure `GATEWAY_CONTEXT_HMAC_SECRET` in the trusted SDK runtime and do not expose it to untrusted callers. Unsigned or modified `__context__` values are rejected with `IdentitySpoofingError`; the legacy `__verified_signature__` boolean is not trusted.
+The SDK only verifies identity contexts with canonical JSON and HMAC-SHA256; it has no context-signing function and never auto-signs an agent identity. Unsigned or modified `__context__` values, and calls that omit context, are rejected with `IdentitySpoofingError`. The legacy `__verified_signature__` boolean is not trusted. Only a trusted identity authority may issue the `__signature__` field.
 
-The HMAC signature protects SDK context integrity. API authorization independently derives identity from the bearer token map. A shared HMAC key is a trust credential: anyone who can use it can sign arbitrary SDK contexts, so it must remain within trusted runtimes.
+The HMAC signature protects SDK context integrity. API authorization independently derives identity from the bearer token map. The SDK verifier and trusted identity authority require `GATEWAY_CONTEXT_HMAC_SECRET`; provision it only to trusted components, never to untrusted agent callers.
+
+DoF=1 financial policy results require a gateway-issued, HMAC-signed `step_up_approval_token` bound to the tool, canonical parameter digest, role, user ID, expiry, and a nonce consumed once per SDK process. The SDK rejects missing, expired, replayed-in-process, malformed, or mismatched approval tokens. `max_allowed_dof` cannot override financial or security invariants; it only allows metadata explicitly classified as parameter-completion disambiguation. Deployments with multiple SDK processes should additionally enforce one-time token consumption in a shared approval store.
 
 ## Audit Integrity and Limitations
 
-The SDK audit ledger hashes canonicalized tool parameters into each SHA-256 block and links each block to its predecessor. A thread lock makes the in-process hash-chain update atomic across threads. This in-memory ledger is not shared across processes or machines and is not externally immutable; use an independently protected append-only audit service when those guarantees are required.
+The SDK audit ledger persists JSONL write-ahead events to `audit_ledger.jsonl` (override with `AUDIT_LEDGER_PATH`). Each SHA-256 block includes the canonical parameter digest and previous block hash. Startup verifies the existing chain and fails closed on corruption. Each authorized call writes `POLICY_EVALUATED` before execution and `EXECUTION_SUCCESS` or `EXECUTION_FAILED` afterward, including latency and a bounded exception summary. A thread lock and fsync protect in-process append/update ordering. This local WAL is not shared safely across processes or machines and is not externally immutable; use an independently protected append-only audit service when those guarantees are required.
 
 ## Deployment
 

@@ -27,14 +27,17 @@ class UnifiedGovernanceEngine:
         params = payload.get("parameters", {})
         context = payload.get("context", {})
 
-        if not tool:
+        if not isinstance(tool, str) or not tool:
             return 2, ["Missing target tool specification"], metadata
 
         if tool not in self.tool_permissions:
             return 2, ["Security Invariant: Tool is unrecognized (Fail-Closed)"], metadata
 
+        if not isinstance(params, dict) or not isinstance(context, dict):
+            return 2, ["Malformed parameters or identity context (Fail-Closed)"], metadata
+
         role = context.get("role")
-        if not role:
+        if not isinstance(role, str) or not role:
             return 2, ["Unauthenticated invocation: Role missing from verified context"], metadata
 
         allowed_roles = self.tool_permissions.get(tool)
@@ -68,6 +71,7 @@ class UnifiedGovernanceEngine:
                         if amount > role_limit:
                             violations.append(f"Amount {amount} exceeds server-enforced limit ({role_limit}); step-up authorization required")
                             dof += 1
+                            metadata["step_up_required"] = True
                 except (InvalidOperation, TypeError):
                     violations.append("Invalid decimal representation for financial amount")
                     dof += 2
