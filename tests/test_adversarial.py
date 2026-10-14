@@ -57,22 +57,9 @@ def test_financial_boundary_tampering_collapses_to_dof_above_one(secured_client)
     assert decision["degrees_of_freedom"] > 1
 
 
-@pytest.mark.parametrize(
-    ("configured_token", "authorization"),
-    [
-        (None, None),
-        ("test-gateway-token", None),
-        ("test-gateway-token", "Bearer wrong-token"),
-    ],
-)
-def test_unauthorized_access_rejected(
-    secured_client, monkeypatch, configured_token, authorization
-):
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong-token"])
+def test_unauthorized_access_rejected(secured_client, authorization):
     client, _headers = secured_client
-    if configured_token is None:
-        monkeypatch.delenv("GATEWAY_API_TOKEN", raising=False)
-    else:
-        monkeypatch.setenv("GATEWAY_API_TOKEN", configured_token)
     headers = {} if authorization is None else {"Authorization": authorization}
     response = client.post(
         "/v1/governance/evaluate",
@@ -88,6 +75,17 @@ def test_unauthorized_access_rejected(
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Unauthorized or Missing Gateway Token"
+
+
+def test_application_startup_fails_without_gateway_token(monkeypatch):
+    monkeypatch.delenv("GATEWAY_API_TOKEN", raising=False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="CRITICAL STARTUP FAILURE: GATEWAY_API_TOKEN is mandatory\\.",
+    ):
+        with TestClient(app):
+            pass
 
 
 def test_sha256_audit_chain_tamper_detection():

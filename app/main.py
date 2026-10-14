@@ -2,16 +2,26 @@
 import hmac
 import yaml
 import time
+from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 from typing import Dict, Any
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from app.engine import AuditLedgerUnavailable, PolicyEngineUnavailable, evaluate_governance
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if not os.getenv("GATEWAY_API_TOKEN"):
+        raise RuntimeError("CRITICAL STARTUP FAILURE: GATEWAY_API_TOKEN is mandatory.")
+    yield
+
+
 app = FastAPI(
     title="Zero-Data Intent Governance Gateway",
     version="3.0.0",
-    description="Sub-millisecond Deterministic AI Governance with Active Disambiguation, Chained Cryptographic Audit, and Real-time Prometheus Observability."
+    description="Sub-millisecond Deterministic AI Governance with Active Disambiguation, Chained Cryptographic Audit, and Real-time Prometheus Observability.",
+    lifespan=lifespan,
 )
 
 # --- مقاييس المراقبة المؤسسية (Prometheus Metrics) ---
