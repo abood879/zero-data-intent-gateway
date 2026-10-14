@@ -1,6 +1,7 @@
-﻿import pytest
+import pytest
 from fastapi.testclient import TestClient
 from app.main import app
+from app import main as gateway_main
 
 client = TestClient(app)
 AUTH_HEADERS = {"Authorization": "Bearer test-gateway-token"}
@@ -8,7 +9,16 @@ AUTH_HEADERS = {"Authorization": "Bearer test-gateway-token"}
 
 @pytest.fixture(autouse=True)
 def configure_gateway_token(monkeypatch):
-    monkeypatch.setenv("GATEWAY_API_TOKEN", "test-gateway-token")
+    monkeypatch.setattr(
+        gateway_main,
+        "TOKEN_IDENTITY_MAP",
+        {
+            "test-gateway-token": {
+                "role": "finance_agent",
+                "user_id": "gateway-test-user",
+            }
+        },
+    )
 
 def test_health_endpoint():
     response = client.get("/health")

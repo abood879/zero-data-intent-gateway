@@ -1,4 +1,4 @@
-﻿version: '3.8'
+version: '3.8'
 
 services:
   # 1. البوابة الحتمية
@@ -10,7 +10,7 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       OPA_URL: http://opa:8181
-      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:?Set GATEWAY_API_TOKEN before starting}
+      TOKEN_IDENTITY_MAP: ${TOKEN_IDENTITY_MAP:?Set TOKEN_IDENTITY_MAP before starting}
     depends_on:
       - redis
       - opa

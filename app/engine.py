@@ -1,18 +1,21 @@
-import json
 import os
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 class UnifiedGovernanceEngine:
     def __init__(self):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
-        self.default_auto_approval = Decimal(os.getenv("GATEWAY_AUTO_APPROVAL_LIMIT", "1000.00"))
         
         self.tool_permissions = {
             "database_drop": ["superadmin"],
             "admin_execute": ["admin"],
             "wire_transfer": ["finance_agent", "admin"],
             "read_records": ["guest", "agent", "support_agent", "finance_agent", "admin"]
+        }
+        self.role_limits = {
+            "finance_agent": Decimal("5000.00"),
+            "admin": Decimal("10000.00"),
+            "agent": Decimal("500.00"),
         }
 
     def evaluate(self, payload: Dict[str, Any]) -> Tuple[int, List[str], Dict[str, Any]]:
@@ -26,6 +29,9 @@ class UnifiedGovernanceEngine:
 
         if not tool:
             return 2, ["Missing target tool specification"], metadata
+
+        if tool not in self.tool_permissions:
+            return 2, ["Security Invariant: Tool is unrecognized (Fail-Closed)"], metadata
 
         role = context.get("role")
         if not role:
@@ -52,9 +58,15 @@ class UnifiedGovernanceEngine:
                         violations.append(f"Amount {amount} exceeds critical invariant limit ({self.critical_financial_limit})")
                         dof += 2
                     else:
-                        role_limit = Decimal(str(context.get("max_limit", self.default_auto_approval)))
+                        role_limit = self.role_limits.get(role)
+                        if role_limit is None:
+                            violations.append(
+                                f"Security Invariant: Role '{role}' has no configured financial limit (Fail-Closed)."
+                            )
+                            dof += 2
+                            return dof, violations, metadata
                         if amount > role_limit:
-                            violations.append(f"Amount {amount} exceeds configured limit ({role_limit}); step-up authorization required")
+                            violations.append(f"Amount {amount} exceeds server-enforced limit ({role_limit}); step-up authorization required")
                             dof += 1
                 except (InvalidOperation, TypeError):
                     violations.append("Invalid decimal representation for financial amount")
