@@ -19,7 +19,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Zero-Data Intent Governance Gateway",
-    version="3.0.0",
+    version="3.1.0",
     description="Sub-millisecond Deterministic AI Governance with Active Disambiguation, Chained Cryptographic Audit, and Real-time Prometheus Observability.",
     lifespan=lifespan,
 )
