@@ -16,7 +16,11 @@ from typing import Any, Callable, Optional
 
 import redis
 
-from app.engine import BudgetStateConflictError, governance_engine
+from app.engine import (
+    BudgetStateConflictError,
+    ReconciliationProofRequiredError,
+    governance_engine,
+)
 
 
 class GatewaySecurityError(Exception):
@@ -398,6 +402,20 @@ class AuditLedger:
 
 
 audit_ledger = AuditLedger()
+
+
+def reconcile_budget_reservation(
+    reservation_id: str,
+    resolution: str,
+    proof: dict[str, Any],
+    operator_id: str,
+) -> bool:
+    return governance_engine.reconcile_reservation(
+        reservation_id,
+        resolution,
+        proof,
+        operator_id,
+    )
 
 
 def _commit_budget_after_execution(

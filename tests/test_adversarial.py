@@ -22,6 +22,7 @@ from sdk import (
     CriticalAuditFailureError,
     DisambiguationRequiredError,
     IdentitySpoofingError,
+    ReconciliationProofRequiredError,
     SecurityViolationError,
     audit_ledger,
     protected_tool,
@@ -751,11 +752,152 @@ def test_expired_reservation_locks_budget_until_resolved(tmp_path, monkeypatch):
     assert budget_reservation_statuses(budget_path, release_user_id) == [
         "EXPIRED_UNRESOLVED"
     ]
-    assert engine.release_budget(release_reservation_id)
+    with pytest.raises(ReconciliationProofRequiredError):
+        engine.release_budget(release_reservation_id)
+    assert engine.reconcile_reservation(
+        release_reservation_id,
+        "RELEASED",
+        {"provider_ref": "provider-release-123"},
+        "operator-1",
+    )
     accepted, _, new_reservation_id = engine.reserve_budget(
         "finance_agent", release_user_id, Decimal("9000.00")
     )
     assert accepted and new_reservation_id
+
+
+def test_release_requires_reconciliation_proof_for_expired_reservation(
+    tmp_path,
+):
+    budget_path = tmp_path / "proof-required-release.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    accepted, _, reservation_id = engine.reserve_budget(
+        "finance_agent", "proof-required-user", Decimal("100.00")
+    )
+    assert accepted and reservation_id
+
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET expires_at = 0 "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+    accepted, _, _ = engine.reserve_budget(
+        "finance_agent", "proof-required-user", Decimal("1.00")
+    )
+    assert accepted
+    assert budget_reservation_statuses(budget_path, "proof-required-user") == [
+        "EXPIRED_UNRESOLVED",
+        "RESERVED",
+    ]
+    with pytest.raises(ReconciliationProofRequiredError):
+        engine.release_budget(reservation_id)
+
+
+def test_reconcile_reservation_requires_valid_proof_and_audits_resolution(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "reconciliation-audit.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    accepted, _, reservation_id = engine.reserve_budget(
+        "finance_agent", "audited-reconciliation-user", Decimal("100.00")
+    )
+    assert accepted and reservation_id
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations "
+            "SET status = 'EXPIRED_UNRESOLVED' WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+
+    with pytest.raises(ValueError, match="idempotency_key or provider_ref"):
+        sdk.reconcile_budget_reservation(
+            reservation_id, "RELEASED", {"note": "checked"}, "operator-1"
+        )
+    with pytest.raises(ValueError, match="Operator ID"):
+        sdk.reconcile_budget_reservation(
+            reservation_id,
+            "RELEASED",
+            {"idempotency_key": "idem-123"},
+            " ",
+        )
+
+    proof = {"idempotency_key": "idem-123", "provider_status": "not_found"}
+    assert sdk.reconcile_budget_reservation(
+        reservation_id, "RELEASED", proof, "operator-1"
+    )
+    assert budget_reservation_statuses(
+        budget_path, "audited-reconciliation-user"
+    ) == ["RELEASED"]
+    with sqlite3.connect(budget_path) as connection:
+        audit = connection.execute(
+            """
+            SELECT previous_status, resolution, proof_json, operator_id
+            FROM budget_reconciliation_audit
+            WHERE reservation_id = ?
+            """,
+            (reservation_id,),
+        ).fetchone()
+    assert audit == (
+        "EXPIRED_UNRESOLVED",
+        "RELEASED",
+        json.dumps(proof, sort_keys=True, separators=(",", ":")),
+        "operator-1",
+    )
+
+
+def test_committed_window_rolls_but_unresolved_holds_do_not(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "dual-window-budgets.sqlite3"
+    monkeypatch.setenv("GATEWAY_BUDGET_WINDOW_SECONDS", "60")
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "10000.00"}',
+    )
+    engine = type(governance_engine)(budget_db_path=budget_path)
+
+    committed_user = "old-committed-user"
+    accepted, _, committed_id = engine.reserve_budget(
+        "finance_agent", committed_user, Decimal("10000.00")
+    )
+    assert accepted and committed_id
+    assert engine.commit_budget(committed_id)
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET reserved_at = 0 "
+            "WHERE reservation_id = ?",
+            (committed_id,),
+        )
+    accepted, _, replacement_id = engine.reserve_budget(
+        "finance_agent", committed_user, Decimal("10000.00")
+    )
+    assert accepted and replacement_id
+
+    unresolved_user = "old-unresolved-user"
+    accepted, _, unresolved_id = engine.reserve_budget(
+        "finance_agent", unresolved_user, Decimal("10000.00")
+    )
+    assert accepted and unresolved_id
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            """
+            UPDATE cumulative_budget_reservations
+            SET reserved_at = 0, expires_at = 0
+            WHERE reservation_id = ?
+            """,
+            (unresolved_id,),
+        )
+    accepted, total, rejected_id = engine.reserve_budget(
+        "finance_agent", unresolved_user, Decimal("1.00")
+    )
+    assert not accepted
+    assert total == Decimal("10000.00")
+    assert rejected_id is None
+    assert budget_reservation_statuses(budget_path, unresolved_user) == [
+        "EXPIRED_UNRESOLVED"
+    ]
 
 
 def test_commit_resolves_expired_unresolved_budget_reservation(tmp_path):

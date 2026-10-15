@@ -12,6 +12,10 @@ class BudgetStateConflictError(RuntimeError):
     """Raised when a reservation is no longer eligible for a state transition."""
 
 
+class ReconciliationProofRequiredError(BudgetStateConflictError):
+    """Raised when a reservation requires audited administrative resolution."""
+
+
 class UnifiedGovernanceEngine:
     def __init__(self, budget_db_path: str | Path | None = None):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
@@ -112,6 +116,19 @@ class UnifiedGovernanceEngine:
                 )
                 connection.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS budget_reconciliation_audit (
+                        audit_id TEXT PRIMARY KEY,
+                        reservation_id TEXT NOT NULL,
+                        previous_status TEXT NOT NULL,
+                        resolution TEXT NOT NULL,
+                        proof_json TEXT NOT NULL,
+                        operator_id TEXT NOT NULL,
+                        reconciled_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS budget_reservations_identity_time
                     ON cumulative_budget_reservations (role, user_id, reserved_at)
                     """
@@ -169,9 +186,14 @@ class UnifiedGovernanceEngine:
                     """
                     SELECT amount
                     FROM cumulative_budget_reservations
-                    WHERE role = ? AND user_id = ? AND status != 'RELEASED'
+                    WHERE role = ? AND user_id = ?
+                      AND (status IN (
+                               'RESERVED',
+                               'EXPIRED_UNRESOLVED',
+                               'RECONCILIATION_REQUIRED'
+                           ) OR (status = 'COMMITTED' AND reserved_at >= ?))
                     """,
-                    (role, user_id),
+                    (role, user_id, window_start),
                 ).fetchall()
                 current_total = sum(
                     (Decimal(row[0]) for row in reservations),
@@ -255,11 +277,142 @@ class UnifiedGovernanceEngine:
         return True
 
     def release_budget(self, reservation_id: str) -> bool:
-        return self._transition_budget_status(
-            reservation_id,
-            ("RESERVED", "EXPIRED_UNRESOLVED", "RECONCILIATION_REQUIRED"),
+        if not reservation_id:
+            return False
+        try:
+            with sqlite3.connect(
+                self.budget_db_path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE cumulative_budget_reservations
+                    SET status = 'RELEASED'
+                    WHERE reservation_id = ? AND status = 'RESERVED'
+                    """,
+                    (reservation_id,),
+                )
+                if cursor.rowcount == 1:
+                    connection.commit()
+                    return True
+                row = connection.execute(
+                    """
+                    SELECT status
+                    FROM cumulative_budget_reservations
+                    WHERE reservation_id = ?
+                    """,
+                    (reservation_id,),
+                ).fetchone()
+                connection.commit()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not release cumulative budget reservation.") from exc
+        if row and row[0] in {
+            "EXPIRED_UNRESOLVED",
+            "RECONCILIATION_REQUIRED",
+        }:
+            raise ReconciliationProofRequiredError(
+                "Provider proof is required to release this unresolved reservation."
+            )
+        return False
+
+    def reconcile_reservation(
+        self,
+        reservation_id: str,
+        resolution: str,
+        proof: dict[str, Any],
+        operator_id: str,
+    ) -> bool:
+        if not isinstance(resolution, str) or resolution not in (
             "RELEASED",
-        )
+            "COMMITTED",
+        ):
+            raise ValueError("Resolution must be 'RELEASED' or 'COMMITTED'.")
+        if not isinstance(proof, dict) or not proof:
+            raise ValueError("Reconciliation proof must be a non-empty dictionary.")
+        if not any(
+            isinstance(proof.get(key), str) and proof[key].strip()
+            for key in ("idempotency_key", "provider_ref")
+        ):
+            raise ValueError(
+                "Reconciliation proof must include an idempotency_key or provider_ref."
+            )
+        if not isinstance(operator_id, str) or not operator_id.strip():
+            raise ValueError("Operator ID must be non-empty.")
+        if not reservation_id:
+            raise ValueError("Reservation ID must be non-empty.")
+        try:
+            proof_json = json.dumps(
+                proof,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Reconciliation proof must be valid JSON data.") from exc
+
+        try:
+            with sqlite3.connect(
+                self.budget_db_path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT status
+                    FROM cumulative_budget_reservations
+                    WHERE reservation_id = ?
+                    """,
+                    (reservation_id,),
+                ).fetchone()
+                if not row or row[0] not in {
+                    "EXPIRED_UNRESOLVED",
+                    "RECONCILIATION_REQUIRED",
+                }:
+                    connection.rollback()
+                    raise BudgetStateConflictError(
+                        f"Budget reservation {reservation_id!r} is not unresolved."
+                    )
+                previous_status = row[0]
+                cursor = connection.execute(
+                    """
+                    UPDATE cumulative_budget_reservations
+                    SET status = ?
+                    WHERE reservation_id = ? AND status = ?
+                    """,
+                    (resolution, reservation_id, previous_status),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise BudgetStateConflictError(
+                        f"Budget reservation {reservation_id!r} changed during reconciliation."
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO budget_reconciliation_audit
+                        (audit_id, reservation_id, previous_status, resolution,
+                         proof_json, operator_id, reconciled_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        reservation_id,
+                        previous_status,
+                        resolution,
+                        proof_json,
+                        operator_id.strip(),
+                        time.time(),
+                    ),
+                )
+                connection.commit()
+                return True
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not persist budget reconciliation.") from exc
 
     def _transition_budget_status(
         self,
