@@ -19,6 +19,7 @@ import redis
 from app.engine import (
     BudgetStateConflictError,
     ReconciliationProofRequiredError,
+    SecurityViolationError,
     governance_engine,
 )
 
@@ -29,10 +30,6 @@ class GatewaySecurityError(Exception):
 
 class ConfirmedToolFailureError(GatewaySecurityError):
     """A proven pre-execution or non-mutating tool abort safe to roll back."""
-
-
-class SecurityViolationError(GatewaySecurityError):
-    pass
 
 
 class DisambiguationRequiredError(GatewaySecurityError):
@@ -409,12 +406,28 @@ def reconcile_budget_reservation(
     resolution: str,
     proof: dict[str, Any],
     operator_id: str,
+    operator_context: Any,
 ) -> bool:
+    try:
+        operator = verify_trusted_identity(operator_context)
+    except IdentitySpoofingError as exc:
+        raise SecurityViolationError(
+            "A verified privileged operator context is required."
+        ) from exc
+    if operator.get("role") not in {
+        "reconciler",
+        "admin",
+        "governance_admin",
+    }:
+        raise SecurityViolationError(
+            "Operator role is not authorized to reconcile reservations."
+        )
     return governance_engine.reconcile_reservation(
         reservation_id,
         resolution,
         proof,
         operator_id,
+        operator_context,
     )
 
 
