@@ -14,6 +14,7 @@ services:
       GATEWAY_CONTEXT_HMAC_SECRET: ${GATEWAY_CONTEXT_HMAC_SECRET:?Set GATEWAY_CONTEXT_HMAC_SECRET before starting}
       AUDIT_LEDGER_PATH: /var/lib/zero-data-gateway/audit_ledger.jsonl
       STEP_UP_NONCE_DB_PATH: /var/lib/zero-data-gateway/step_up_nonces.sqlite3
+      GATEWAY_BUDGET_DB_PATH: /var/lib/zero-data-gateway/cumulative_budgets.sqlite3
     depends_on:
       - redis
       - opa

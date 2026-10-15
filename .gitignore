@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 env/
 audit_ledger.jsonl
+step_up_nonces.sqlite3*
+cumulative_budgets.sqlite3*

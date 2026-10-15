@@ -14,6 +14,8 @@ from app.main import app
 import sdk
 from sdk import (
     AuditLedger,
+    AuditLedgerError,
+    CriticalAuditFailureError,
     DisambiguationRequiredError,
     IdentitySpoofingError,
     SecurityViolationError,
@@ -23,6 +25,36 @@ from sdk import (
 
 client = TestClient(app)
 TEST_TOKEN = "adversarial-test-token"
+
+
+def _append_audit_record_in_process(arguments: tuple[str, int]) -> str:
+    path, index = arguments
+    ledger = AuditLedger(path)
+    return ledger.record(
+        "wire_transfer",
+        {"amount": str(index)},
+        {"role": "finance_agent", "user_id": "audit-process-test"},
+        "EXECUTION_SUCCESS",
+        dof=0,
+        decision="SUCCEEDED",
+    )
+
+
+def _execute_transfer_in_process(amount: str) -> bool:
+    from sdk import SecurityViolationError, protected_tool
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str):
+        return "TRANSFERRED"
+
+    context = gateway_main._issue_trusted_context(
+        {"role": "finance_agent", "user_id": "concurrent-budget-test"}
+    )
+    try:
+        transfer(amount=amount, __context__=context)
+        return True
+    except SecurityViolationError:
+        return False
 
 
 def _consume_nonce_in_process(path: str, nonce: str, expires_at: float) -> bool:
@@ -246,6 +278,44 @@ def test_tamper_evident_audit_ledger_hashes_parameters_atomically(tmp_path):
     assert ledger.last_hash == chain[-1]["hash"]
 
 
+def test_audit_ledger_chain_is_continuous_across_processes(tmp_path):
+    ledger_path = tmp_path / "multiprocess-audit.jsonl"
+    worker_count = 4
+    record_count = 32
+
+    with multiprocessing.get_context("spawn").Pool(worker_count) as pool:
+        appended_hashes = pool.map(
+            _append_audit_record_in_process,
+            [(str(ledger_path), index) for index in range(record_count)],
+        )
+
+    ledger = AuditLedger(ledger_path)
+    records = ledger.chain
+    assert len(records) == record_count
+    assert len(set(appended_hashes)) == record_count
+    assert all(
+        record["prev_hash"]
+        == (
+            AuditLedger.GENESIS_HASH
+            if index == 0
+            else records[index - 1]["hash"]
+        )
+        for index, record in enumerate(records)
+    )
+    for record in records:
+        payload = {key: value for key, value in record.items() if key != "hash"}
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        assert record["hash"] == expected_hash
+
+
 def test_max_allowed_dof_does_not_bypass_financial_step_up():
     identity = gateway_main._issue_trusted_context(
         {"role": "finance_agent", "user_id": "finance-user"}
@@ -413,6 +483,61 @@ def test_max_allowed_dof_cannot_bypass_security_invariants():
             amount="15000.00",
             __context__=trusted_context("finance_agent"),
         )
+
+
+def test_concurrent_transfers_cannot_exceed_cumulative_budget(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "concurrent-budgets.sqlite3"
+    monkeypatch.setenv("GATEWAY_BUDGET_DB_PATH", str(budget_path))
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "5000.00"}',
+    )
+    monkeypatch.setenv("GATEWAY_BUDGET_WINDOW_SECONDS", "3600")
+    from app.engine import UnifiedGovernanceEngine
+
+    UnifiedGovernanceEngine(budget_db_path=budget_path)
+    with multiprocessing.get_context("spawn").Pool(2) as pool:
+        results = pool.map(
+            _execute_transfer_in_process,
+            ["3000.00"] * 2,
+        )
+
+    assert results.count(True) == 1
+    assert results.count(False) == 1
+
+
+def test_successful_execution_with_failed_audit_requires_reconciliation(
+    tmp_path, monkeypatch
+):
+    ledger = AuditLedger(tmp_path / "critical-audit.jsonl")
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    original_record = ledger.record
+
+    def fail_success_record(*args, **kwargs):
+        if args[3] == "EXECUTION_SUCCESS":
+            raise AuditLedgerError("success event could not be persisted")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "record", fail_success_record)
+    executed = []
+
+    @protected_tool(tool_name="admin_execute")
+    def side_effecting_operation():
+        executed.append(True)
+        return "COMPLETED"
+
+    with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED") as exc:
+        side_effecting_operation(
+            __context__=gateway_main._issue_trusted_context(
+                {"role": "admin", "user_id": "audit-failure-user"}
+            )
+        )
+
+    assert executed == [True]
+    assert exc.value.status == "RECONCILIATION_REQUIRED"
+    assert exc.value.reconciliation_required is True
 
 
 def test_tool_execution_failure_is_written_to_persistent_ledger(

@@ -1,4 +1,5 @@
 import functools
+import fcntl
 import hashlib
 import hmac
 import inspect
@@ -8,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -36,6 +38,13 @@ class IdentitySpoofingError(GatewaySecurityError):
 
 class AuditLedgerError(GatewaySecurityError):
     pass
+
+
+class CriticalAuditFailureError(AuditLedgerError):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.status = "RECONCILIATION_REQUIRED"
+        self.reconciliation_required = True
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -272,28 +281,43 @@ class AuditLedger:
             return tuple(dict(record) for record in self._chain)
 
     def _load_existing_chain(self) -> None:
-        if not self.path.exists():
-            return
         try:
-            with self.path.open("r", encoding="utf-8") as ledger_file:
-                for line in ledger_file:
-                    record = json.loads(line)
-                    if not isinstance(record, dict):
-                        raise ValueError("record must be a JSON object")
-                    block_hash = record.pop("hash", None)
-                    if record.get("prev_hash") != self._last_hash:
-                        raise ValueError("previous hash does not match")
-                    expected_hash = hashlib.sha256(_canonical_json(record)).hexdigest()
-                    if not isinstance(block_hash, str) or not hmac.compare_digest(
-                        block_hash, expected_hash
-                    ):
-                        raise ValueError("record hash does not match")
-                    self._last_hash = block_hash
-                    self._chain.append({**record, "hash": block_hash})
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a+", encoding="utf-8") as ledger_file:
+                fcntl.flock(ledger_file.fileno(), fcntl.LOCK_SH)
+                try:
+                    self._chain = self._read_chain(ledger_file)
+                    self._last_hash = (
+                        self._chain[-1]["hash"]
+                        if self._chain
+                        else self.GENESIS_HASH
+                    )
+                finally:
+                    fcntl.flock(ledger_file.fileno(), fcntl.LOCK_UN)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise AuditLedgerError(
                 f"Audit ledger is unreadable or corrupt at {self.path}."
             ) from exc
+
+    def _read_chain(self, ledger_file) -> list[dict[str, Any]]:
+        records = []
+        previous_hash = self.GENESIS_HASH
+        ledger_file.seek(0)
+        for line in ledger_file:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("record must be a JSON object")
+            block_hash = record.pop("hash", None)
+            if record.get("prev_hash") != previous_hash:
+                raise ValueError("previous hash does not match")
+            expected_hash = hashlib.sha256(_canonical_json(record)).hexdigest()
+            if not isinstance(block_hash, str) or not hmac.compare_digest(
+                block_hash, expected_hash
+            ):
+                raise ValueError("record hash does not match")
+            previous_hash = block_hash
+            records.append({**record, "hash": block_hash})
+        return records
 
     def record(
         self,
@@ -313,34 +337,46 @@ class AuditLedger:
             raise AuditLedgerError("Audit parameters are not canonical JSON.") from exc
 
         with self._lock:
-            payload = {
-                "prev_hash": self._last_hash,
-                "timestamp": time.time(),
-                "tool": tool,
-                "role": context.get("role"),
-                "user_id": context.get("user_id"),
-                "status": status,
-                "dof": dof,
-                "decision": decision,
-                "params_digest": params_digest,
-                "execution_latency": execution_latency,
-                "exception_summary": exception_summary,
-            }
-            encoded_payload = _canonical_json(payload)
-            block_hash = hashlib.sha256(encoded_payload).hexdigest()
-            record = {**payload, "hash": block_hash}
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8", newline="\n") as ledger_file:
-                    ledger_file.write(_canonical_json(record).decode("utf-8") + "\n")
-                    ledger_file.flush()
-                    os.fsync(ledger_file.fileno())
-            except OSError as exc:
+                with self.path.open("a+", encoding="utf-8", newline="\n") as ledger_file:
+                    fcntl.flock(ledger_file.fileno(), fcntl.LOCK_EX)
+                    try:
+                        chain = self._read_chain(ledger_file)
+                        previous_hash = (
+                            chain[-1]["hash"] if chain else self.GENESIS_HASH
+                        )
+                        payload = {
+                            "prev_hash": previous_hash,
+                            "timestamp": time.time(),
+                            "tool": tool,
+                            "role": context.get("role"),
+                            "user_id": context.get("user_id"),
+                            "status": status,
+                            "dof": dof,
+                            "decision": decision,
+                            "params_digest": params_digest,
+                            "execution_latency": execution_latency,
+                            "exception_summary": exception_summary,
+                        }
+                        block_hash = hashlib.sha256(
+                            _canonical_json(payload)
+                        ).hexdigest()
+                        record = {**payload, "hash": block_hash}
+                        ledger_file.seek(0, os.SEEK_END)
+                        ledger_file.write(
+                            _canonical_json(record).decode("utf-8") + "\n"
+                        )
+                        ledger_file.flush()
+                        os.fsync(ledger_file.fileno())
+                    finally:
+                        fcntl.flock(ledger_file.fileno(), fcntl.LOCK_UN)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise AuditLedgerError(
-                    f"Could not persist audit event to {self.path}."
+                    f"Could not verify or persist audit event to {self.path}."
                 ) from exc
 
-            self._chain.append(record)
+            self._chain = chain + [record]
             self._last_hash = block_hash
             return block_hash
 
@@ -379,6 +415,24 @@ def _evaluate_and_authorize(
         decision = "DENIED_UNCLASSIFIED_DOF"
     else:
         decision = "APPROVED"
+
+    if tool == "wire_transfer" and dof < 2 and (
+        not metadata.get("step_up_required") or step_up_approved
+    ):
+        amount = Decimal(str(parameters["amount"]))
+        reserved, cumulative_total = governance_engine.reserve_cumulative_budget(
+            str(identity["role"]),
+            str(identity["user_id"]),
+            amount,
+        )
+        if not reserved:
+            reasons.append(
+                "Cumulative financial budget exceeded for this identity and time window."
+            )
+            dof = 2
+            decision = "DENIED_CUMULATIVE_BUDGET"
+        else:
+            metadata["cumulative_budget_total"] = str(cumulative_total)
 
     audit_ledger.record(
         tool,
@@ -429,23 +483,28 @@ def _run_with_audit(
         raise
     finally:
         failed = execution_error is not None
-        audit_ledger.record(
-            tool,
-            parameters,
-            identity,
-            "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
-            dof=dof,
-            decision="FAILED" if failed else "SUCCEEDED",
-            execution_latency=time.perf_counter() - started_at,
-            exception_summary=(
-                {
-                    "type": type(execution_error).__name__,
-                    "message": str(execution_error)[:500],
-                }
-                if execution_error is not None
-                else None
-            ),
-        )
+        try:
+            audit_ledger.record(
+                tool,
+                parameters,
+                identity,
+                "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
+                dof=dof,
+                decision="FAILED" if failed else "SUCCEEDED",
+                execution_latency=time.perf_counter() - started_at,
+                exception_summary=(
+                    {
+                        "type": type(execution_error).__name__,
+                        "message": str(execution_error)[:500],
+                    }
+                    if execution_error is not None
+                    else None
+                ),
+            )
+        except Exception as exc:
+            raise CriticalAuditFailureError(
+                "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
+            ) from exc
     return result
 
 
@@ -468,23 +527,28 @@ async def _run_async_with_audit(
         raise
     finally:
         failed = execution_error is not None
-        audit_ledger.record(
-            tool,
-            parameters,
-            identity,
-            "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
-            dof=dof,
-            decision="FAILED" if failed else "SUCCEEDED",
-            execution_latency=time.perf_counter() - started_at,
-            exception_summary=(
-                {
-                    "type": type(execution_error).__name__,
-                    "message": str(execution_error)[:500],
-                }
-                if execution_error is not None
-                else None
-            ),
-        )
+        try:
+            audit_ledger.record(
+                tool,
+                parameters,
+                identity,
+                "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
+                dof=dof,
+                decision="FAILED" if failed else "SUCCEEDED",
+                execution_latency=time.perf_counter() - started_at,
+                exception_summary=(
+                    {
+                        "type": type(execution_error).__name__,
+                        "message": str(execution_error)[:500],
+                    }
+                    if execution_error is not None
+                    else None
+                ),
+            )
+        except Exception as exc:
+            raise CriticalAuditFailureError(
+                "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
+            ) from exc
     return result
 
 
