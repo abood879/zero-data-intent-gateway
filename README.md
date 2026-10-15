@@ -1,90 +1,74 @@
-﻿# Zero-Data Intent Governance Gateway (v3.1.0)
+# Zero-Data Intent Gateway
 
-[![CI](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions)
-[![Release](https://img.shields.io/github/v/release/abood879/zero-data-intent-gateway?color=blue)](https://github.com/abood879/zero-data-intent-gateway/releases/latest)
-[![Version](https://img.shields.io/badge/version-v3.1.0-blue.svg)](https://github.com/abood879/zero-data-intent-gateway/releases/tag/v3.1.0)
-[![Tests Passing](https://img.shields.io/badge/tests-22%2F22%20passed-brightgreen)](https://github.com/abood879/zero-data-intent-gateway)
+> "We don't just tell AI agents what they shouldn't do. We control what they can execute."
 
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?style=flat&logo=FastAPI&logoColor=white)](https://fastapi.tiangolo.com)
-[![Python 3.11](https://img.shields.io/badge/Python-3.11+-3776AB.svg?style=flat&logo=Python&logoColor=white)](https://python.org)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg?style=flat&logo=docker&logoColor=white)](https://docker.com)
-[![Enterprise CI Pipeline](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/abood879/zero-data-intent-gateway/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+**A fail-closed policy enforcement and transaction-control plane for autonomous AI agents: deterministic authorization, durable execution state, provider-level idempotency, and cryptographic forensic recovery for high-impact financial actions.**
 
-A sub-millisecond line-rate governance middleware designed to enforce deterministic state boundaries over autonomous enterprise AI agents. Deterministic Zero-LLM Evaluation: Eliminates LLM nondeterminism from the critical enforcement path.
+## Architecture & Design Principles: Enterprise Blueprint v2
 
-## 🧪 Instant Reproduction (One-Line Verification)
+Enterprise Blueprint v2 is the target production architecture. The repository currently contains a Python gateway and SDK with SQLite-backed budget reservations and a local hash-chained audit ledger; the distributed proxy and state-engine components below describe the planned production evolution, not features already deployed by this repository.
 
-```bash
-# Run full adversarial and fail-fast test suite locally
-pytest tests/ -v
-```
+### Out-of-Process Egress Proxy
 
----
-
-## Architectural Philosophy: Deterministic State Collapse (DoF)
-
-Traditional AI guardrails rely on secondary probabilistic models (LLM-as-a-Judge), compounding latency, operational cost, and nondeterministic failure vectors. The **Zero-Data Intent Architecture** evaluates mission-critical enterprise transactions through dynamic **Degrees of Freedom (DoF)**:
-
-$$DoF = N_{\text{violations}} + N_{\text{missing parameters}}$$
-
-### The 3 Operational Tiers
-
-| Tier | State | Mathematical Condition | Behavior | Latency / Tokens |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tier 1** | **Intent Lock** | $DoF = 0$ | Bypasses downstream LLM inference entirely. Executes pre-cleared operations instantly with deterministic state resolution. | **<0.05 ms** / **0 Tokens** |
-| **Tier 2** | **Active Disambiguation** | $DoF = 1$ | Intercepts isolated parameter ambiguity (e.g., missing sign-off). Dispatches a targeted probe back to the caller to collapse state to $DoF = 0$ without triggering approval fatigue. | **<0.05 ms** / **0 Tokens** |
-| **Tier 3** | **Deterministic Halt** | $DoF > 1$ | Hard stop on multi-vector policy violations or unauthorized vendors. Records forensic cryptographic state and halts execution. | **<0.05 ms** / **0 Tokens** |
-
-## Empirical Micro-Benchmarks
-
-Reference measurements for deterministic Tier 1 In-Memory Kernel Evaluation Latency:
-
-| Metric | Latency |
-| :--- | :--- |
-| Median (p50) | 9.3 µs (0.0093 ms) |
-| Mean | 10.005 µs (0.0100 ms) |
-| 95th percentile (p95) | 11.897 µs (0.0118 ms) |
-| 99th percentile (p99) | 37.3 µs (0.0373 ms) |
-
-Run the benchmark from the repository root with:
-
-```bash
-python -m benchmarks.benchmark
-```
-
-The benchmark measures 1,000 Tier 1 evaluations with audit appends stubbed. Results vary with the execution environment.
-
----
-
-## Core Security & Enterprise Architecture
-
-* **Strict Constrained Schemas**: Enforces `ConfigDict(strict=True, extra="forbid")` via Pydantic to neutralize prompt injections and structural bypass attempts at wire speed.
-* **Distributed Atomic Ledger**: Built with Redis append-only streams and atomic Lua scripts to prevent race conditions across multi-worker clusters. Gracefully falls back to local in-memory hashing for isolated nodes.
-* **Policy-as-Code via OPA**: Integrates with Open Policy Agent (OPA Sidecar) running custom declarative Rego policies (`config/policy.rego`).
-* **Tamper-Evident SHA-256 Cryptographically Chained Ledger**: Each transaction decision is anchored in a SHA-256 hash chain that detects unauthorized tampering:
-  $$\text{Audit Hash}_{i} = \text{SHA256}(\text{Audit Hash}_{i-1} \parallel \text{Payload} \parallel \text{Decision} \parallel \text{Timestamp})$$
-* **Enterprise Observability**: Real-time Prometheus metrics exporter (`/metrics`) exposing latency histograms and decision counters.
-* **Automated CI/CD Pipeline**: GitHub Actions test automation running complete functional suites and Docker container builds on every commit.
-* **Agentic Python SDK**: Direct wrapper (`sdk.py`) providing drop-in integration with LangChain, CrewAI, AutoGen, or custom autonomous pipelines.
-
----
-
-## System Topology
+The production design places an independent egress gateway between agent workloads and external providers:
 
 ```text
-[ Autonomous AI Agent ]
-         │
-         ▼ (HTTP POST / Payload)
-┌────────────────────────────────────────────────────────┐
-│  Zero-Data Intent Governance Gateway (:8080)           │
-│  ├─ Strict Schema Validator (Pydantic / Strict Type)   │
-│  ├─ Deterministic State Engine (DoF Calculation)       │
-│  └─ Prometheus Exporter (/metrics)                     │
-└────────┬──────────────────────────────────────┬────────┘
-         │ (Sidecar Evaluation)                 │ (Audit Append)
-         ▼                                      ▼
-┌──────────────────┐                  ┌──────────────────┐
-│ OPA Engine (:8181│                  │ Redis Ledger     │
-│ (Rego Policies)  │                  │ (:6379 / Atomic) │
-└──────────────────┘                  └──────────────────┘
+┌────────────────────────┐       ┌─────────────────────────────┐       ┌──────────────────┐
+│ AI agent runtime       │──────▶│ Egress gateway / sidecar    │──────▶│ External provider│
+│ No provider credentials│       │ Policy, budget, idempotency │       │                  │
+│ Direct egress blocked  │       │ Dispatch and reconciliation │       │                  │
+└────────────────────────┘       └──────────────┬──────────────┘       └──────────────────┘
+                                                 │
+                                  ┌──────────────┴──────────────┐
+                                  │ Durable state and audit     │
+                                  └─────────────────────────────┘
+```
+
+- The AI agent runtime holds **zero external provider credentials**.
+- Network policy blocks direct provider egress from agent workloads; provider traffic must traverse the gateway.
+- The gateway is intended to be a separate process and network-enforced security boundary, not merely an SDK decorator.
+- A durable dispatch-intent record and a provider-supported idempotency key provide the basis for crash recovery and reconciliation. An intent record alone cannot prove whether a remote provider completed an operation.
+
+### Ultra-Low Latency State Engine
+
+The current implementation uses SQLite for budget reservations and local durable state. Enterprise Blueprint v2 envisions moving the shared, distributed control plane to PostgreSQL and/or Redis, selected according to each operation's consistency and durability requirements.
+
+- PostgreSQL is a candidate for transactional budget, idempotency, and outbox state across gateway instances.
+- Redis with carefully scoped atomic scripts is a candidate for latency-sensitive coordination where its persistence and recovery guarantees meet the deployment requirements.
+- Audit events are intended to flow through an outbox to Kafka or Redpanda, with asynchronous external/WORM anchoring.
+- Sub-millisecond distributed operation is a design target to validate with representative benchmarks and failure testing, not a performance guarantee of the current repository.
+
+### Deterministic Idempotency Lifecycle
+
+Each idempotency key is bound to a canonical payload hash and the relevant transaction identity. The durable lifecycle is:
+
+| State | Meaning | Retry behavior |
+| --- | --- | --- |
+| `PENDING` | Reservation or execution is active; outcome is not yet final. | Reject duplicate in-flight requests; reconcile uncertain outcomes. |
+| `COMMITTED` | The operation has a confirmed successful outcome. | Return the cached confirmation for a matching payload. |
+| `ABORTED` | The operation was confirmed to have aborted before dispatch. | Allow a new reservation for the same key and matching payload. |
+
+A mismatched payload hash is rejected as an idempotency conflict. The production design intends to derive stable keys from a canonical payload hash plus stable agent and workflow identifiers, so retries can retain their identity across process restarts. Provider-level idempotency and reconciliation remain essential: local state cannot by itself guarantee exactly-once effects at a remote provider.
+
+## Red-Team Audit Status
+
+The project has undergone a rigorous architectural Red-Team review focused on the boundary between an in-process SDK and a distributed financial gateway. The review highlighted the need for network-enforced egress control, durable state shared across workers, deterministic retry identity, and explicit handling of uncertain provider outcomes.
+
+- **Test result:** `python3 -m pytest tests/ -v` passed **63/63 tests** in the current full test suite, including adversarial coverage for in-flight network failures locking budgets for reconciliation, currency-isolated budget tracking, and rejection of payload tampering.
+- **Lifecycle hardening:** Matching retries after a confirmed pre-dispatch abort are permitted; committed duplicates receive cached confirmations; post-dispatch exceptions remain unresolved for reconciliation.
+- **Architecture assessment:** Enterprise Blueprint v2 received an **8.5/10** vision assessment as a production-grade paradigm for enterprise FinTech integration. This is an architectural assessment, not a certification or evidence that the target distributed components are already deployed.
+
+## Current Repository Status
+
+The codebase is an evolving implementation, not yet the complete Enterprise Blueprint v2 deployment:
+
+- Python policy evaluation and protected-tool SDK in `app/engine.py` and `sdk.py`.
+- SQLite-backed cumulative budget reservations and idempotency registry.
+- Local JSONL audit ledger with a SHA-256 hash chain and sanitized exception summaries.
+- Adversarial and API tests runnable with:
+
+```bash
+python3 -m pytest tests/ -v
+```
+
+For the current security model, deployment limitations, and configuration details, see [SECURITY.md](SECURITY.md).
