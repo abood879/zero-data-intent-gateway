@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import hmac
+import logging
 import math
 import sqlite3
 import time
@@ -11,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+logger = logging.getLogger(__name__)
 
 ROLE_CURRENCY_TRANSACTION_LIMITS = {
     "finance_operator": {
@@ -54,7 +56,27 @@ class UnsupportedCurrencyError(SecurityViolationError):
 
 class UnifiedGovernanceEngine:
     def __init__(self, budget_db_path: str | Path | None = None):
-        self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
+        self.critical_financial_limits = dict(CRITICAL_FINANCIAL_LIMITS)
+        critical_limit_prefix = "GATEWAY_CRITICAL_LIMIT_"
+        for setting, configured_limit in os.environ.items():
+            if not setting.startswith(critical_limit_prefix):
+                continue
+            currency = setting[len(critical_limit_prefix) :].upper()
+            if len(currency) != 3 or not currency.isalpha():
+                raise ValueError(
+                    f"{setting} must use a three-letter currency code."
+                )
+            try:
+                parsed_limit = Decimal(configured_limit)
+            except InvalidOperation as exc:
+                raise ValueError(
+                    f"{setting} must be a decimal."
+                ) from exc
+            if not parsed_limit.is_finite() or parsed_limit <= 0:
+                raise ValueError(
+                    f"{setting} must be positive."
+                )
+            self.critical_financial_limits[currency] = parsed_limit
         self.budget_window_seconds = int(
             os.getenv("GATEWAY_BUDGET_WINDOW_SECONDS", "3600")
         )
@@ -118,6 +140,11 @@ class UnifiedGovernanceEngine:
             self.role_currency_budget_limits[role] = parsed_limits
             if "USD" in parsed_limits:
                 self.role_budget_limits[role] = parsed_limits["USD"]
+        logger.info(
+            "Active financial policy: transaction_limits=%s cumulative_limits=%s",
+            self.critical_financial_limits,
+            self.role_currency_budget_limits,
+        )
 
         self.budget_db_path = Path(
             budget_db_path
@@ -194,7 +221,10 @@ class UnifiedGovernanceEngine:
                         amount TEXT NOT NULL,
                         currency TEXT NOT NULL,
                         tool_name TEXT,
-                        context_user_id TEXT
+                        context_user_id TEXT,
+                        payload_hash TEXT,
+                        status TEXT NOT NULL DEFAULT 'PENDING',
+                        updated_at TEXT
                     )
                     """
                 )
@@ -212,14 +242,31 @@ class UnifiedGovernanceEngine:
                     connection.execute(
                         "ALTER TABLE idempotency_registry ADD COLUMN context_user_id TEXT"
                     )
+                if "payload_hash" not in registry_columns:
+                    connection.execute(
+                        "ALTER TABLE idempotency_registry ADD COLUMN payload_hash TEXT"
+                    )
+                if "status" not in registry_columns:
+                    connection.execute(
+                        "ALTER TABLE idempotency_registry "
+                        "ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING'"
+                    )
+                if "updated_at" not in registry_columns:
+                    connection.execute(
+                        "ALTER TABLE idempotency_registry ADD COLUMN updated_at TEXT"
+                    )
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO idempotency_registry
                         (idempotency_key, reservation_id, created_at, role, amount,
-                         currency, tool_name, context_user_id)
+                         currency, tool_name, context_user_id, payload_hash, status, updated_at)
                     SELECT idempotency_key, reservation_id,
                            strftime('%Y-%m-%dT%H:%M:%fZ', reserved_at, 'unixepoch'),
-                           role, amount, currency, 'wire_transfer', user_id
+                           role, amount, currency, 'wire_transfer', user_id, NULL,
+                           CASE WHEN status = 'COMMITTED' THEN 'COMMITTED'
+                                WHEN status = 'RELEASED' THEN 'ABORTED'
+                                ELSE 'PENDING' END,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', reserved_at, 'unixepoch')
                     FROM cumulative_budget_reservations
                     WHERE idempotency_key IS NOT NULL
                     """
@@ -284,6 +331,42 @@ class UnifiedGovernanceEngine:
             (window_start,),
         )
 
+    @staticmethod
+    def _idempotency_payload_hash(
+        tool_name: str,
+        role: str,
+        context_user_id: str,
+        amount: str,
+        currency: str,
+    ) -> str:
+        payload = {
+            "tool_name": tool_name,
+            "role": role,
+            "context_user_id": context_user_id,
+            "amount": amount,
+            "currency": currency,
+        }
+        canonical_payload = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical_payload).hexdigest()
+
+    @staticmethod
+    def _cached_confirmation(
+        idempotency_key: str,
+        reservation_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "status": "COMMITTED",
+            "idempotency_key": idempotency_key,
+            "reservation_id": reservation_id,
+            "cached": True,
+        }
+
     def reserve_budget(
         self,
         role: str,
@@ -292,9 +375,31 @@ class UnifiedGovernanceEngine:
         idempotency_key: str | None = None,
         currency: str = "USD",
         tool_name: str = "wire_transfer",
+        payload_hash: str | None = None,
     ) -> tuple[bool, Decimal, str | None, str | None]:
+        result = self.reserve_budget_with_confirmation(
+            role,
+            user_id,
+            amount,
+            idempotency_key,
+            currency,
+            tool_name,
+            payload_hash,
+        )
+        return result[:4]
+
+    def reserve_budget_with_confirmation(
+        self,
+        role: str,
+        user_id: str,
+        amount: Decimal,
+        idempotency_key: str | None = None,
+        currency: str = "USD",
+        tool_name: str = "wire_transfer",
+        payload_hash: str | None = None,
+    ) -> tuple[bool, Decimal, str | None, str | None, dict[str, Any] | None]:
         if not user_id or not amount.is_finite() or amount <= 0:
-            return False, Decimal("0"), None, None
+            return False, Decimal("0"), None, None, None
         if idempotency_key is None:
             idempotency_key = uuid.uuid4().hex
         elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
@@ -306,6 +411,10 @@ class UnifiedGovernanceEngine:
         if budget_limit is None:
             raise UnsupportedCurrencyError(
                 f"No cumulative budget policy is configured for role {role!r} in {currency}."
+            )
+        if payload_hash is None:
+            payload_hash = self._idempotency_payload_hash(
+                tool_name, role, user_id, str(amount), currency
             )
 
         now = time.time()
@@ -324,6 +433,41 @@ class UnifiedGovernanceEngine:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("BEGIN IMMEDIATE")
                 self._cleanup_stale_reservations(connection, now, window_start)
+                existing = connection.execute(
+                    """
+                    SELECT reservation_id, payload_hash, status, role,
+                           context_user_id, tool_name, amount, currency
+                    FROM idempotency_registry WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    if (
+                        existing[1] != payload_hash
+                        or existing[3] != role
+                        or existing[4] != user_id
+                        or existing[5] != tool_name
+                        or existing[6] != str(amount)
+                        or existing[7] != currency
+                    ):
+                        connection.rollback()
+                        raise IdempotencyConflictError(
+                            "Idempotency key was previously used with a different payload."
+                        )
+                    if existing[2] == "COMMITTED":
+                        connection.commit()
+                        return (
+                            True,
+                            Decimal(existing[6]),
+                            existing[0],
+                            None,
+                            self._cached_confirmation(idempotency_key, existing[0]),
+                        )
+                    if existing[2] != "ABORTED":
+                        connection.rollback()
+                        raise IdempotencyConflictError(
+                            "Idempotency key already has an in-flight operation."
+                        )
                 reservations = connection.execute(
                     """
                     SELECT amount
@@ -343,25 +487,58 @@ class UnifiedGovernanceEngine:
                 next_total = current_total + amount
                 if next_total > budget_limit:
                     connection.commit()
-                    return False, current_total, None, None
-                connection.execute(
-                    """
-                    INSERT INTO idempotency_registry
-                        (idempotency_key, reservation_id, created_at, role, amount,
-                         currency, tool_name, context_user_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        idempotency_key,
-                        reservation_id,
-                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        role,
-                        str(amount),
-                        currency,
-                        tool_name,
-                        user_id,
-                    ),
+                    return False, current_total, None, None, None
+                updated_at = datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
                 )
+                if existing:
+                    old_reservation_id = existing[0]
+                    if old_reservation_id:
+                        connection.execute(
+                            """
+                            UPDATE cumulative_budget_reservations
+                            SET idempotency_key = NULL
+                            WHERE reservation_id = ? AND status = 'RELEASED'
+                            """,
+                            (old_reservation_id,),
+                        )
+                    connection.execute(
+                        """
+                        UPDATE idempotency_registry
+                        SET reservation_id = ?, status = 'PENDING', updated_at = ?,
+                            amount = ?, currency = ?
+                        WHERE idempotency_key = ? AND status = 'ABORTED'
+                        """,
+                        (
+                            reservation_id,
+                            updated_at,
+                            str(amount),
+                            currency,
+                            idempotency_key,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO idempotency_registry
+                            (idempotency_key, reservation_id, created_at, role, amount,
+                             currency, tool_name, context_user_id, payload_hash,
+                             status, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                        """,
+                        (
+                            idempotency_key,
+                            reservation_id,
+                            updated_at,
+                            role,
+                            str(amount),
+                            currency,
+                            tool_name,
+                            user_id,
+                            payload_hash,
+                            updated_at,
+                        ),
+                    )
                 connection.execute(
                     """
                     INSERT INTO cumulative_budget_reservations
@@ -383,7 +560,7 @@ class UnifiedGovernanceEngine:
                     ),
                 )
                 connection.commit()
-                return True, next_total, reservation_id, execution_token
+                return True, next_total, reservation_id, execution_token, None
         except sqlite3.IntegrityError as exc:
             raise IdempotencyConflictError(
                 f"Idempotency key {idempotency_key!r} is already registered."
@@ -397,7 +574,8 @@ class UnifiedGovernanceEngine:
         tool_name: str,
         role: str,
         context_user_id: str,
-    ) -> None:
+        payload_hash: str,
+    ) -> dict[str, Any] | None:
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("Idempotency key must be a non-empty string.")
         if not tool_name or not role or not context_user_id:
@@ -410,28 +588,95 @@ class UnifiedGovernanceEngine:
             ) as connection:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
+                existing = connection.execute(
                     """
-                    INSERT INTO idempotency_registry
-                        (idempotency_key, reservation_id, created_at, role, amount,
-                         currency, tool_name, context_user_id)
-                    VALUES (?, NULL, ?, ?, '0', 'N/A', ?, ?)
+                    SELECT reservation_id, payload_hash, status, role,
+                           context_user_id, tool_name
+                    FROM idempotency_registry WHERE idempotency_key = ?
                     """,
-                    (
-                        idempotency_key,
-                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        role,
-                        tool_name,
-                        context_user_id,
-                    ),
-                )
+                    (idempotency_key,),
+                ).fetchone()
+                now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                if existing:
+                    if (
+                        existing[1] != payload_hash
+                        or existing[3] != role
+                        or existing[4] != context_user_id
+                        or existing[5] != tool_name
+                    ):
+                        connection.rollback()
+                        raise IdempotencyConflictError(
+                            "Idempotency key was previously used with a different payload."
+                        )
+                    if existing[2] == "COMMITTED":
+                        connection.commit()
+                        return self._cached_confirmation(idempotency_key, existing[0])
+                    if existing[2] != "ABORTED":
+                        connection.rollback()
+                        raise IdempotencyConflictError(
+                            "Idempotency key already has an in-flight operation."
+                        )
+                    connection.execute(
+                        """
+                        UPDATE idempotency_registry
+                        SET status = 'PENDING', updated_at = ?, reservation_id = NULL
+                        WHERE idempotency_key = ? AND status = 'ABORTED'
+                        """,
+                        (now, idempotency_key),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO idempotency_registry
+                            (idempotency_key, reservation_id, created_at, role, amount,
+                             currency, tool_name, context_user_id, payload_hash,
+                             status, updated_at)
+                        VALUES (?, NULL, ?, ?, '0', 'N/A', ?, ?, ?, 'PENDING', ?)
+                        """,
+                        (
+                            idempotency_key,
+                            now,
+                            role,
+                            tool_name,
+                            context_user_id,
+                            payload_hash,
+                            now,
+                        ),
+                    )
                 connection.commit()
+                return None
+        except IdempotencyConflictError:
+            raise
         except sqlite3.IntegrityError as exc:
             raise IdempotencyConflictError(
                 f"Idempotency key {idempotency_key!r} is already registered."
             ) from exc
         except sqlite3.Error as exc:
             raise RuntimeError("Could not register mutation idempotency key.") from exc
+
+    def mark_idempotency_status(
+        self,
+        idempotency_key: str,
+        status: str,
+    ) -> None:
+        if status not in {"COMMITTED", "ABORTED"}:
+            raise ValueError("Idempotency status must be COMMITTED or ABORTED.")
+        try:
+            with sqlite3.connect(self.budget_db_path, timeout=10) as connection:
+                connection.execute(
+                    """
+                    UPDATE idempotency_registry
+                    SET status = ?, updated_at = ?
+                    WHERE idempotency_key = ? AND status = 'PENDING'
+                    """,
+                    (
+                        status,
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        idempotency_key,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not update mutation idempotency status.") from exc
 
     def commit_budget(
         self,
@@ -466,14 +711,28 @@ class UnifiedGovernanceEngine:
                 cursor = connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
-                                        SET status = 'COMMITTED', committed_at = ?, execution_token = NULL
+                    SET status = 'COMMITTED', committed_at = ?, execution_token = NULL
                     WHERE reservation_id = ?
-                                            AND execution_token = ?
-                                            AND status IN ('RESERVED', 'EXPIRED_UNRESOLVED')
+                      AND execution_token = ?
+                      AND status IN ('RESERVED', 'EXPIRED_UNRESOLVED')
                     """,
-                                        (committed_at, reservation_id, execution_token),
+                    (committed_at, reservation_id, execution_token),
                 )
                 if cursor.rowcount == 1:
+                    registry_row = connection.execute(
+                        "SELECT idempotency_key FROM cumulative_budget_reservations "
+                        "WHERE reservation_id = ?",
+                        (reservation_id,),
+                    ).fetchone()
+                    if registry_row and registry_row[0]:
+                        connection.execute(
+                            """
+                            UPDATE idempotency_registry
+                            SET status = 'COMMITTED', updated_at = ?
+                            WHERE idempotency_key = ? AND status = 'PENDING'
+                            """,
+                            (committed_at, registry_row[0]),
+                        )
                     connection.commit()
                     return True
                 connection.commit()
@@ -506,15 +765,34 @@ class UnifiedGovernanceEngine:
             ) as connection:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("BEGIN IMMEDIATE")
+                key_row = connection.execute(
+                    "SELECT idempotency_key FROM cumulative_budget_reservations "
+                    "WHERE reservation_id = ? AND status = 'RESERVED'",
+                    (reservation_id,),
+                ).fetchone()
                 cursor = connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
-                    SET status = 'RELEASED'
+                    SET status = 'RELEASED', idempotency_key = NULL
                     WHERE reservation_id = ? AND status = 'RESERVED'
                     """,
                     (reservation_id,),
                 )
                 if cursor.rowcount == 1:
+                    if key_row and key_row[0]:
+                        connection.execute(
+                            """
+                            UPDATE idempotency_registry
+                            SET status = 'ABORTED', updated_at = ?
+                            WHERE idempotency_key = ? AND status = 'PENDING'
+                            """,
+                            (
+                                datetime.now(timezone.utc).isoformat().replace(
+                                    "+00:00", "Z"
+                                ),
+                                key_row[0],
+                            ),
+                        )
                     connection.commit()
                     return True
                 row = connection.execute(
@@ -726,10 +1004,18 @@ class UnifiedGovernanceEngine:
                 cursor = connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
-                    SET status = ?, committed_at = ?
+                    SET status = ?, committed_at = ?,
+                        idempotency_key = CASE WHEN ? = 'RELEASED' THEN NULL
+                                               ELSE idempotency_key END
                     WHERE reservation_id = ? AND status = ?
                     """,
-                    (resolution, committed_at, reservation_id, previous_status),
+                    (
+                        resolution,
+                        committed_at,
+                        resolution,
+                        reservation_id,
+                        previous_status,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     connection.rollback()
@@ -751,6 +1037,18 @@ class UnifiedGovernanceEngine:
                         proof_json,
                         operator["identity"]["user_id"],
                         time.time(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE idempotency_registry
+                    SET status = ?, updated_at = ?
+                    WHERE idempotency_key = ?
+                    """,
+                    (
+                        "ABORTED" if resolution == "RELEASED" else "COMMITTED",
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        bound_key,
                     ),
                 )
                 connection.commit()
@@ -894,7 +1192,7 @@ class UnifiedGovernanceEngine:
                     role_limit = ROLE_CURRENCY_TRANSACTION_LIMITS.get(
                         role, {}
                     ).get(currency)
-                    critical_limit = CRITICAL_FINANCIAL_LIMITS.get(currency)
+                    critical_limit = self.critical_financial_limits.get(currency)
                     if not amount.is_finite() or amount <= Decimal("0"):
                         violations.append("Amount must be strictly positive")
                         dof += 2

@@ -656,6 +656,107 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
     }
 
 
+def test_pre_dispatch_abort_allows_same_key_retry_with_matching_payload(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "idempotency-retry-budgets.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "idempotency-retry-ledger.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    calls = 0
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str, idempotency_key: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConfirmedToolFailureError("local validation rejected transfer")
+        return "TRANSFERRED"
+
+    context = trusted_context("finance_agent", "same-key-retry-user")
+    arguments = {
+        "amount": "100.00",
+        "idempotency_key": "same-key-after-abort",
+        "__context__": context,
+    }
+    with pytest.raises(ConfirmedToolFailureError, match="local validation"):
+        transfer(**arguments)
+
+    assert budget_reservation_statuses(
+        budget_path, "same-key-retry-user"
+    ) == ["RELEASED"]
+    with sqlite3.connect(budget_path) as connection:
+        first_reservation_id = connection.execute(
+            "SELECT reservation_id FROM cumulative_budget_reservations "
+            "WHERE idempotency_key IS NULL"
+        ).fetchone()[0]
+        registry_before_retry = connection.execute(
+            "SELECT payload_hash, status FROM idempotency_registry "
+            "WHERE idempotency_key = ?",
+            ("same-key-after-abort",),
+        ).fetchone()
+    assert registry_before_retry[1] == "ABORTED"
+
+    assert transfer(**arguments) == "TRANSFERRED"
+    assert calls == 2
+    with sqlite3.connect(budget_path) as connection:
+        second_reservation_id, status, updated_payload_hash = connection.execute(
+            """
+            SELECT r.reservation_id, i.status, i.payload_hash
+            FROM idempotency_registry AS i
+            JOIN cumulative_budget_reservations AS r
+              ON r.reservation_id = i.reservation_id
+            WHERE i.idempotency_key = ?
+            """,
+            ("same-key-after-abort",),
+        ).fetchone()
+    assert second_reservation_id != first_reservation_id
+    assert status == "COMMITTED"
+    assert updated_payload_hash == registry_before_retry[0]
+
+
+def test_confirmed_failure_after_dispatch_requires_reconciliation(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "confirmed-flight-budgets.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "confirmed-flight-ledger.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+
+    def provider_dispatch(**_):
+        raise ConfirmedToolFailureError("provider response reported a failure")
+
+    transport = sdk.SecureProviderTransport(provider_dispatch)
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str, idempotency_key: str):
+        return transport.dispatch(
+            idempotency_key=idempotency_key,
+            payload={"amount": amount},
+        )
+
+    user_id = "confirmed-flight-user"
+    with pytest.raises(ConfirmedToolFailureError, match="provider response"):
+        transfer(
+            amount="100.00",
+            idempotency_key="confirmed-flight-key",
+            __context__=trusted_context("finance_agent", user_id),
+        )
+
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
+    assert ledger.chain[-1]["status"] == "EXECUTION_UNCERTAIN"
+    assert ledger.chain[-1]["decision"] == "OUTCOME_UNKNOWN"
+    with sqlite3.connect(budget_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM idempotency_registry WHERE idempotency_key = ?",
+            ("confirmed-flight-key",),
+        ).fetchone() == ("PENDING",)
+
+
 def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
     budget_path = tmp_path / "ambiguous-timeout-budgets.sqlite3"
     monkeypatch.setenv(
@@ -905,10 +1006,11 @@ def test_idempotency_registry_tombstone_survives_budget_cleanup(tmp_path):
     assert reservation is None
     assert registry == ("permanent-key",)
 
-    with pytest.raises(IdempotencyConflictError):
-        engine.reserve_budget(
-            "finance_agent", "tombstone-user", Decimal("10.00"), "permanent-key"
-        )
+    accepted, _, retry_reservation_id, _ = engine.reserve_budget(
+        "finance_agent", "tombstone-user", Decimal("10.00"), "permanent-key"
+    )
+    assert accepted and retry_reservation_id
+    assert retry_reservation_id != reservation_id
 
 
 def test_audit_events_include_budget_correlation_fields(tmp_path, monkeypatch):
@@ -966,6 +1068,17 @@ def test_currency_specific_single_transaction_limits_fail_closed_or_step_up():
     assert any("No single-transaction limit" in violation for violation in violations)
 
 
+def test_critical_limits_load_dynamic_currency_settings_without_legacy_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GATEWAY_CRITICAL_LIMIT", "1")
+    monkeypatch.setenv("GATEWAY_CRITICAL_LIMIT_GBP", "7500.25")
+    engine = type(governance_engine)(budget_db_path=tmp_path / "critical-limits.sqlite3")
+
+    assert engine.critical_financial_limits["USD"] == Decimal("5000")
+    assert engine.critical_financial_limits["GBP"] == Decimal("7500.25")
+
+
 def test_nonfinancial_mutation_keys_are_permanently_registered(tmp_path, monkeypatch):
     budget_path = tmp_path / "mutation-idempotency.sqlite3"
     engine = type(governance_engine)(budget_db_path=budget_path)
@@ -974,25 +1087,43 @@ def test_nonfinancial_mutation_keys_are_permanently_registered(tmp_path, monkeyp
         sdk, "audit_ledger", AuditLedger(tmp_path / "mutation-idempotency.jsonl")
     )
 
+    executions = []
+
     @protected_tool(tool_name="admin_execute")
     def admin_operation(operation: str, idempotency_key: str):
+        executions.append(operation)
         return operation
 
     context = trusted_context("admin", "mutation-admin")
     assert admin_operation(
         operation="rotate", idempotency_key="mutation-once", __context__=context
     ) == "rotate"
-    with pytest.raises(IdempotencyConflictError):
+    cached_confirmation = admin_operation(
+        operation="rotate", idempotency_key="mutation-once", __context__=context
+    )
+    assert cached_confirmation == {
+        "status": "COMMITTED",
+        "idempotency_key": "mutation-once",
+        "reservation_id": None,
+        "cached": True,
+    }
+    with pytest.raises(IdempotencyConflictError, match="different payload"):
         admin_operation(
-            operation="rotate", idempotency_key="mutation-once", __context__=context
+            operation="delete",
+            idempotency_key="mutation-once",
+            __context__=context,
         )
+    assert executions == ["rotate"]
     with sqlite3.connect(budget_path) as connection:
         entry = connection.execute(
-            "SELECT tool_name, context_user_id FROM idempotency_registry "
+            "SELECT tool_name, context_user_id, payload_hash, status "
+            "FROM idempotency_registry "
             "WHERE idempotency_key = ?",
             ("mutation-once",),
         ).fetchone()
-    assert entry == ("admin_execute", "mutation-admin")
+    assert entry[:2] == ("admin_execute", "mutation-admin")
+    assert entry[2]
+    assert entry[3] == "COMMITTED"
 
 
 def test_secure_provider_transport_transmits_gateway_idempotency_key():
@@ -1810,6 +1941,36 @@ def test_tool_execution_failure_is_written_to_persistent_ledger(
         "message": "execution failed for test",
     }
     assert events[-1]["execution_latency"] >= 0
+
+
+def test_exception_account_number_is_redacted_in_persistent_audit_ledger(
+    tmp_path, monkeypatch
+):
+    ledger_path = tmp_path / "redacted-exception-audit.jsonl"
+    ledger = AuditLedger(ledger_path)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+
+    @protected_tool(tool_name="admin_execute")
+    def broken_operation(idempotency_key: str):
+        raise ValueError(
+            "provider rejected account 123456789012\n"
+            "Traceback (most recent call last): raw stack detail"
+        )
+
+    with pytest.raises(ValueError):
+        broken_operation(
+            idempotency_key="redacted-exception-key",
+            __context__=trusted_context("admin", "redacted-exception-user"),
+        )
+
+    events = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    exception_summary = events[-1]["exception_summary"]
+    assert exception_summary == {
+        "type": "ValueError",
+        "message": "provider rejected account [REDACTED_ACCOUNT]",
+    }
+    assert "123456789012" not in ledger_path.read_text()
+    assert "Traceback" not in ledger_path.read_text()
 
 
 def test_persistent_audit_chain_continues_across_instances(tmp_path):

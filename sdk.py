@@ -10,6 +10,8 @@ import sqlite3
 import threading
 import time
 import uuid
+import re
+from contextvars import ContextVar
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +31,85 @@ from app.engine import (
 _IDEMPOTENT_TOOL_NAMES = frozenset(
     {"wire_transfer", "admin_execute", "database_drop"}
 )
+PHASE_PRE_DISPATCH = "PRE_DISPATCH"
+PHASE_IN_FLIGHT = "IN_FLIGHT"
+_execution_phase: ContextVar[str | None] = ContextVar(
+    "gateway_execution_phase", default=None
+)
+
+
+def _mark_execution_in_flight() -> None:
+    if _execution_phase.get() == PHASE_PRE_DISPATCH:
+        _execution_phase.set(PHASE_IN_FLIGHT)
+
+
+def _sanitize_exception_message_legacy(exception: BaseException | str) -> str:
+    message = str(exception)
+    summary = message.splitlines()[0] if message else ""
+    patterns = (
+        (re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), "[REDACTED_CARD]"),
+        (re.compile(r"(?<!\d)(?:\d[ -]?){8,12}(?!\d)"), "[REDACTED_ACCOUNT]"),
+        (
+            re.compile(r"(?i)\b(?:bearer\s+)[A-Za-z0-9._~+/=-]+"),
+            "Bearer [REDACTED]",
+        ),
+        (
+            re.compile(
+                r"(?i)\b(?:api[_-]?key|access[_-]?token|secret|token|key)"
+                r"\s*[:=]\s*[^\s,;]+"
+            ),
+            "[REDACTED_CREDENTIAL]",
+        ),
+        (
+            re.compile(r"\b(?:sk|pk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b", re.I),
+            "[REDACTED_TOKEN]",
+        ),
+    )
+    for pattern, replacement in patterns:
+        summary = pattern.sub(replacement, summary)
+    return summary[:500]
+
+
+def _sanitize_exception_message(message: BaseException | str) -> str:
+    summary = _sanitize_exception_message_legacy(message)
+    patterns = (
+        (re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), "[REDACTED_CARD]"),
+        (re.compile(r"(?<!\d)(?:\d[ -]?){8,12}(?!\d)"), "[REDACTED_ACCOUNT]"),
+        (
+            re.compile(r"(?i)\b(?:bearer\s+)[A-Za-z0-9._~+/=-]+"),
+            "Bearer [REDACTED_CREDENTIAL]",
+        ),
+        (
+            re.compile(
+                r"(?i)\b(?:authorization|x-api-key|api[_-]?key|access[_-]?token|"
+                r"refresh[_-]?token|secret|token|key|password|passwd|credential)"
+                r"\b\s*[:=]\s*[\"']?[^\s,;\"']+"
+            ),
+            "[REDACTED_CREDENTIAL]",
+        ),
+        (
+            re.compile(
+                r"\b(?:sk|pk|ghp|gho|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b",
+                re.I,
+            ),
+            "[REDACTED_TOKEN]",
+        ),
+        (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED_TOKEN]"),
+        (
+            re.compile(r"\beyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{5,}\b"),
+            "[REDACTED_TOKEN]",
+        ),
+    )
+    for pattern, replacement in patterns:
+        summary = pattern.sub(replacement, summary)
+    return summary[:500]
+
+
+def _exception_summary(exception: BaseException) -> dict[str, str]:
+    return {
+        "type": type(exception).__name__,
+        "message": _sanitize_exception_message(exception),
+    }
 
 
 class GatewaySecurityError(Exception):
@@ -85,6 +166,7 @@ class SecureProviderTransport:
             raise SecurityViolationError(
                 "Provider dispatch requires a gateway idempotency_key."
             )
+        _mark_execution_in_flight()
         outbound_headers["Idempotency-Key"] = resolved_key
         outbound_payload["idempotency_key"] = resolved_key
         return self._dispatch(
@@ -421,7 +503,18 @@ class AuditLedger:
                             "decision": decision,
                             "params_digest": params_digest,
                             "execution_latency": execution_latency,
-                            "exception_summary": exception_summary,
+                            "exception_summary": (
+                                {
+                                    "type": str(
+                                        exception_summary.get("type", "Exception")
+                                    ).splitlines()[0][:100],
+                                    "message": _sanitize_exception_message(
+                                        exception_summary.get("message", "")
+                                    ),
+                                }
+                                if exception_summary is not None
+                                else None
+                            ),
                             "reservation_id": reservation_id,
                             "resolved_idempotency_key": resolved_idempotency_key,
                             "currency": currency,
@@ -496,10 +589,7 @@ def _commit_budget_after_execution(
                 "COMMIT_CONFLICT_RECONCILIATION",
                 dof=dof,
                 decision="RECONCILIATION_REQUIRED",
-                exception_summary={
-                    "type": type(exc).__name__,
-                    "message": str(exc)[:500],
-                },
+                exception_summary=_exception_summary(exc),
                 reservation_id=reservation_id,
                 resolved_idempotency_key=resolved_idempotency_key,
                 currency=currency,
@@ -521,7 +611,15 @@ def _evaluate_and_authorize(
     identity: dict[str, Any],
     max_allowed_dof: int,
     step_up_approval_token: Any,
-) -> tuple[int, list[str], str | None, str | None, str | None, str | None]:
+) -> tuple[
+    int,
+    list[str],
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    dict[str, Any] | None,
+]:
     dof, reasons, metadata = governance_engine.evaluate(
         {
             "tool": tool,
@@ -551,7 +649,10 @@ def _evaluate_and_authorize(
     execution_token = None
     resolved_idempotency_key = None
     resolved_currency = None
+    cached_confirmation = None
+    idempotency_registered = False
     try:
+        payload_hash = _parameters_digest(parameters) if tool in _IDEMPOTENT_TOOL_NAMES else None
         if tool in _IDEMPOTENT_TOOL_NAMES:
             idempotency_key = parameters.get("idempotency_key")
             if idempotency_key is None:
@@ -573,13 +674,17 @@ def _evaluate_and_authorize(
                 cumulative_total,
                 reservation_id,
                 execution_token,
-            ) = governance_engine.reserve_budget(
+                cached_confirmation,
+            ) = governance_engine.reserve_budget_with_confirmation(
                 str(identity["role"]),
                 str(identity["user_id"]),
                 amount,
                 resolved_idempotency_key,
                 currency,
+                tool,
+                payload_hash,
             )
+            idempotency_registered = reservation_id is not None and cached_confirmation is None
             resolved_currency = currency
             if not reserved:
                 reasons.append(
@@ -592,12 +697,14 @@ def _evaluate_and_authorize(
         elif tool in _IDEMPOTENT_TOOL_NAMES and dof < 2 and (
             not metadata.get("step_up_required") or step_up_approved
         ):
-            governance_engine.register_mutation_idempotency_key(
+            cached_confirmation = governance_engine.register_mutation_idempotency_key(
                 resolved_idempotency_key,
                 tool,
                 str(identity["role"]),
                 str(identity["user_id"]),
+                payload_hash,
             )
+            idempotency_registered = cached_confirmation is None
 
         audit_ledger.record(
             tool,
@@ -636,10 +743,15 @@ def _evaluate_and_authorize(
             execution_token,
             resolved_idempotency_key,
             resolved_currency,
+            cached_confirmation,
         )
     except BaseException:
-        if reservation_id:
+        if reservation_id and execution_token:
             governance_engine.release_budget(reservation_id)
+        elif idempotency_registered and resolved_idempotency_key:
+            governance_engine.mark_idempotency_status(
+                resolved_idempotency_key, "ABORTED"
+            )
         raise
 
 
@@ -666,12 +778,19 @@ def _run_with_audit(
         raise
     finally:
         failed = execution_error is not None
-        confirmed_failure = isinstance(execution_error, ConfirmedToolFailureError)
+        confirmed_failure = (
+            _execution_phase.get() == PHASE_PRE_DISPATCH
+            and isinstance(execution_error, ConfirmedToolFailureError)
+        )
         if reservation_id and failed:
             if confirmed_failure:
                 governance_engine.release_budget(reservation_id)
             else:
                 governance_engine.flag_for_reconciliation(reservation_id)
+        elif failed and confirmed_failure and resolved_idempotency_key:
+            governance_engine.mark_idempotency_status(
+                resolved_idempotency_key, "ABORTED"
+            )
         try:
             audit_ledger.record(
                 tool,
@@ -694,10 +813,7 @@ def _run_with_audit(
                 ),
                 execution_latency=time.perf_counter() - started_at,
                 exception_summary=(
-                    {
-                        "type": type(execution_error).__name__,
-                        "message": str(execution_error)[:500],
-                    }
+                    _exception_summary(execution_error)
                     if execution_error is not None
                     else None
                 ),
@@ -721,6 +837,10 @@ def _run_with_audit(
                 execution_token,
                 resolved_idempotency_key,
                 currency,
+            )
+        elif not failed and resolved_idempotency_key:
+            governance_engine.mark_idempotency_status(
+                resolved_idempotency_key, "COMMITTED"
             )
     return result
 
@@ -748,12 +868,19 @@ async def _run_async_with_audit(
         raise
     finally:
         failed = execution_error is not None
-        confirmed_failure = isinstance(execution_error, ConfirmedToolFailureError)
+        confirmed_failure = (
+            _execution_phase.get() == PHASE_PRE_DISPATCH
+            and isinstance(execution_error, ConfirmedToolFailureError)
+        )
         if reservation_id and failed:
             if confirmed_failure:
                 governance_engine.release_budget(reservation_id)
             else:
                 governance_engine.flag_for_reconciliation(reservation_id)
+        elif failed and confirmed_failure and resolved_idempotency_key:
+            governance_engine.mark_idempotency_status(
+                resolved_idempotency_key, "ABORTED"
+            )
         try:
             audit_ledger.record(
                 tool,
@@ -776,10 +903,7 @@ async def _run_async_with_audit(
                 ),
                 execution_latency=time.perf_counter() - started_at,
                 exception_summary=(
-                    {
-                        "type": type(execution_error).__name__,
-                        "message": str(execution_error)[:500],
-                    }
+                    _exception_summary(execution_error)
                     if execution_error is not None
                     else None
                 ),
@@ -803,6 +927,10 @@ async def _run_async_with_audit(
                 execution_token,
                 resolved_idempotency_key,
                 currency,
+            )
+        elif not failed and resolved_idempotency_key:
+            governance_engine.mark_idempotency_status(
+                resolved_idempotency_key, "COMMITTED"
             )
     return result
 
@@ -892,6 +1020,7 @@ def protected_tool(
                 execution_token,
                 resolved_idempotency_key,
                 currency,
+                cached_confirmation,
             ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
@@ -899,25 +1028,45 @@ def protected_tool(
                 max_allowed_dof,
                 approval_token,
             )
-            tool_args, tool_kwargs = _inject_idempotency_key(
-                signature,
-                args,
-                call_kwargs,
-                resolved_idempotency_key,
+            if cached_confirmation is not None:
+                return cached_confirmation
+            phase_token = (
+                _execution_phase.set(PHASE_PRE_DISPATCH)
+                if _execution_phase.get() is None
+                else None
             )
-            return _run_with_audit(
-                func,
-                tool_args,
-                tool_kwargs,
-                target_tool,
-                bound_args,
-                identity,
-                dof,
-                reservation_id,
-                execution_token,
-                resolved_idempotency_key,
-                currency,
-            )
+            try:
+                try:
+                    tool_args, tool_kwargs = _inject_idempotency_key(
+                        signature,
+                        args,
+                        call_kwargs,
+                        resolved_idempotency_key,
+                    )
+                except BaseException:
+                    if reservation_id and execution_token:
+                        governance_engine.release_budget(reservation_id)
+                    elif resolved_idempotency_key:
+                        governance_engine.mark_idempotency_status(
+                            resolved_idempotency_key, "ABORTED"
+                        )
+                    raise
+                return _run_with_audit(
+                    func,
+                    tool_args,
+                    tool_kwargs,
+                    target_tool,
+                    bound_args,
+                    identity,
+                    dof,
+                    reservation_id,
+                    execution_token,
+                    resolved_idempotency_key,
+                    currency,
+                )
+            finally:
+                if phase_token is not None:
+                    _execution_phase.reset(phase_token)
 
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs) -> Any:
@@ -933,6 +1082,7 @@ def protected_tool(
                 execution_token,
                 resolved_idempotency_key,
                 currency,
+                cached_confirmation,
             ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
@@ -940,25 +1090,45 @@ def protected_tool(
                 max_allowed_dof,
                 approval_token,
             )
-            tool_args, tool_kwargs = _inject_idempotency_key(
-                signature,
-                args,
-                call_kwargs,
-                resolved_idempotency_key,
+            if cached_confirmation is not None:
+                return cached_confirmation
+            phase_token = (
+                _execution_phase.set(PHASE_PRE_DISPATCH)
+                if _execution_phase.get() is None
+                else None
             )
-            return await _run_async_with_audit(
-                func,
-                tool_args,
-                tool_kwargs,
-                target_tool,
-                bound_args,
-                identity,
-                dof,
-                reservation_id,
-                execution_token,
-                resolved_idempotency_key,
-                currency,
-            )
+            try:
+                try:
+                    tool_args, tool_kwargs = _inject_idempotency_key(
+                        signature,
+                        args,
+                        call_kwargs,
+                        resolved_idempotency_key,
+                    )
+                except BaseException:
+                    if reservation_id and execution_token:
+                        governance_engine.release_budget(reservation_id)
+                    elif resolved_idempotency_key:
+                        governance_engine.mark_idempotency_status(
+                            resolved_idempotency_key, "ABORTED"
+                        )
+                    raise
+                return await _run_async_with_audit(
+                    func,
+                    tool_args,
+                    tool_kwargs,
+                    target_tool,
+                    bound_args,
+                    identity,
+                    dof,
+                    reservation_id,
+                    execution_token,
+                    resolved_idempotency_key,
+                    currency,
+                )
+            finally:
+                if phase_token is not None:
+                    _execution_phase.reset(phase_token)
 
         if inspect.iscoroutinefunction(func):
             return async_wrapper
