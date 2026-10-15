@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main as gateway_main
-from app.engine import BudgetStateConflictError, governance_engine
+from app.engine import governance_engine
 from app.main import app
 import sdk
 from sdk import (
@@ -632,7 +632,9 @@ def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
         valid_transfer(amount="2000.00", __context__=context)
 
 
-def test_success_after_reservation_expiry_is_reconciled(tmp_path, monkeypatch):
+def test_success_after_reservation_expiry_commits_without_orphaning(
+    tmp_path, monkeypatch
+):
     budget_path = tmp_path / "late-commit-budgets.sqlite3"
     monkeypatch.setenv(
         "GATEWAY_ROLE_BUDGET_LIMITS",
@@ -655,13 +657,12 @@ def test_success_after_reservation_expiry_is_reconciled(tmp_path, monkeypatch):
             )
         return "TRANSFERRED"
 
-    with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
-        transfer_after_expiry(amount="4000.00", __context__=context)
+    assert transfer_after_expiry(amount="4000.00", __context__=context) == "TRANSFERRED"
 
     assert budget_reservation_statuses(budget_path, user_id) == [
-        "RECONCILIATION_REQUIRED"
+        "COMMITTED"
     ]
-    assert ledger.chain[-1]["status"] == "COMMIT_CONFLICT_RECONCILIATION"
+    assert ledger.chain[-1]["status"] == "EXECUTION_SUCCESS"
 
     @protected_tool(tool_name="wire_transfer")
     def valid_transfer(amount: str):
@@ -693,8 +694,12 @@ def test_successful_transfer_commits_budget_reservation(tmp_path, monkeypatch):
     assert budget_reservation_statuses(budget_path, user_id) == ["COMMITTED"]
 
 
-def test_stale_budget_reservation_is_expired_and_ignored(tmp_path, monkeypatch):
+def test_expired_reservation_locks_budget_until_resolved(tmp_path, monkeypatch):
     budget_path = tmp_path / "expired-budgets.sqlite3"
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "10000.00"}',
+    )
     monkeypatch.setenv("GATEWAY_BUDGET_RESERVATION_TTL_SECONDS", "1")
     engine = type(governance_engine)(budget_db_path=budget_path)
     accepted, _, stale_reservation_id = engine.reserve_budget(
@@ -709,16 +714,51 @@ def test_stale_budget_reservation_is_expired_and_ignored(tmp_path, monkeypatch):
             (stale_reservation_id,),
         )
 
-    accepted, _, current_reservation_id = engine.reserve_budget(
-        "finance_agent", "expired-reservation-user", Decimal("9000.00")
+    accepted, current_total, current_reservation_id = engine.reserve_budget(
+        "finance_agent", "expired-reservation-user", Decimal("2000.00")
     )
-    assert accepted and current_reservation_id
+    assert not accepted
+    assert current_total == Decimal("9000.00")
+    assert current_reservation_id is None
     assert budget_reservation_statuses(
         budget_path, "expired-reservation-user"
-    ) == ["EXPIRED", "RESERVED"]
+    ) == ["EXPIRED_UNRESOLVED"]
+
+    assert engine.commit_budget(stale_reservation_id)
+    assert budget_reservation_statuses(
+        budget_path, "expired-reservation-user"
+    ) == ["COMMITTED"]
+    accepted, _, _ = engine.reserve_budget(
+        "finance_agent", "expired-reservation-user", Decimal("2000.00")
+    )
+    assert not accepted
+
+    release_user_id = "expired-release-user"
+    accepted, _, release_reservation_id = engine.reserve_budget(
+        "finance_agent", release_user_id, Decimal("9000.00")
+    )
+    assert accepted and release_reservation_id
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET expires_at = 0 "
+            "WHERE reservation_id = ?",
+            (release_reservation_id,),
+        )
+    accepted, _, _ = engine.reserve_budget(
+        "finance_agent", release_user_id, Decimal("2000.00")
+    )
+    assert not accepted
+    assert budget_reservation_statuses(budget_path, release_user_id) == [
+        "EXPIRED_UNRESOLVED"
+    ]
+    assert engine.release_budget(release_reservation_id)
+    accepted, _, new_reservation_id = engine.reserve_budget(
+        "finance_agent", release_user_id, Decimal("9000.00")
+    )
+    assert accepted and new_reservation_id
 
 
-def test_commit_rejects_expired_budget_reservation(tmp_path):
+def test_commit_resolves_expired_unresolved_budget_reservation(tmp_path):
     budget_path = tmp_path / "stale-commit-budgets.sqlite3"
     engine = type(governance_engine)(budget_db_path=budget_path)
     accepted, _, reservation_id = engine.reserve_budget(
@@ -728,15 +768,15 @@ def test_commit_rejects_expired_budget_reservation(tmp_path):
 
     with sqlite3.connect(budget_path) as connection:
         connection.execute(
-            "UPDATE cumulative_budget_reservations SET status = 'EXPIRED' "
+            "UPDATE cumulative_budget_reservations "
+            "SET status = 'EXPIRED_UNRESOLVED' "
             "WHERE reservation_id = ?",
             (reservation_id,),
         )
 
-    with pytest.raises(BudgetStateConflictError):
-        engine.commit_budget(reservation_id)
+    assert engine.commit_budget(reservation_id)
     assert budget_reservation_statuses(budget_path, "stale-commit-user") == [
-        "EXPIRED"
+        "COMMITTED"
     ]
 
 

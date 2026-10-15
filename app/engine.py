@@ -105,6 +105,13 @@ class UnifiedGovernanceEngine:
                     )
                 connection.execute(
                     """
+                    UPDATE cumulative_budget_reservations
+                    SET status = 'EXPIRED_UNRESOLVED'
+                    WHERE status = 'EXPIRED'
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS budget_reservations_identity_time
                     ON cumulative_budget_reservations (role, user_id, reserved_at)
                     """
@@ -123,7 +130,7 @@ class UnifiedGovernanceEngine:
         connection.execute(
             """
             UPDATE cumulative_budget_reservations
-            SET status = 'EXPIRED'
+            SET status = 'EXPIRED_UNRESOLVED'
             WHERE status = 'RESERVED' AND expires_at <= ?
             """,
             (now,),
@@ -131,8 +138,7 @@ class UnifiedGovernanceEngine:
         connection.execute(
             """
             DELETE FROM cumulative_budget_reservations
-                        WHERE reserved_at <= ?
-                            AND status NOT IN ('RECONCILIATION_REQUIRED', 'EXPIRED')
+            WHERE reserved_at <= ? AND status = 'RELEASED'
             """,
             (window_start,),
         )
@@ -163,13 +169,9 @@ class UnifiedGovernanceEngine:
                     """
                     SELECT amount
                     FROM cumulative_budget_reservations
-                                        WHERE role = ? AND user_id = ?
-                                            AND (status = 'RECONCILIATION_REQUIRED' OR
-                                                     (reserved_at > ? AND
-                                                        (status = 'COMMITTED' OR
-                                                         (status = 'RESERVED' AND expires_at > ?))))
+                    WHERE role = ? AND user_id = ? AND status != 'RELEASED'
                     """,
-                    (role, user_id, window_start, now),
+                    (role, user_id),
                 ).fetchall()
                 current_total = sum(
                     (Decimal(row[0]) for row in reservations),
@@ -212,27 +214,27 @@ class UnifiedGovernanceEngine:
             ) as connection:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("BEGIN IMMEDIATE")
-                cursor = connection.execute(
-                    """
-                    UPDATE cumulative_budget_reservations
-                    SET status = 'COMMITTED'
-                    WHERE reservation_id = ? AND status = 'RESERVED'
-                      AND expires_at > ?
-                    """,
-                    (reservation_id, now),
-                )
-                if cursor.rowcount == 1:
-                    connection.commit()
-                    return True
                 connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
-                    SET status = 'EXPIRED'
+                    SET status = 'EXPIRED_UNRESOLVED'
                     WHERE reservation_id = ? AND status = 'RESERVED'
                       AND expires_at <= ?
                     """,
                     (reservation_id, now),
                 )
+                cursor = connection.execute(
+                    """
+                    UPDATE cumulative_budget_reservations
+                    SET status = 'COMMITTED'
+                    WHERE reservation_id = ?
+                      AND status IN ('RESERVED', 'EXPIRED_UNRESOLVED')
+                    """,
+                    (reservation_id,),
+                )
+                if cursor.rowcount == 1:
+                    connection.commit()
+                    return True
                 connection.commit()
         except sqlite3.Error as exc:
             raise RuntimeError("Could not commit cumulative budget reservation.") from exc
@@ -242,7 +244,9 @@ class UnifiedGovernanceEngine:
 
     def flag_for_reconciliation(self, reservation_id: str) -> bool:
         transitioned = self._transition_budget_status(
-            reservation_id, ("RESERVED", "EXPIRED"), "RECONCILIATION_REQUIRED"
+            reservation_id,
+            ("RESERVED", "EXPIRED_UNRESOLVED"),
+            "RECONCILIATION_REQUIRED",
         )
         if not transitioned:
             raise BudgetStateConflictError(
@@ -252,7 +256,9 @@ class UnifiedGovernanceEngine:
 
     def release_budget(self, reservation_id: str) -> bool:
         return self._transition_budget_status(
-            reservation_id, ("RESERVED", "EXPIRED"), "RELEASED"
+            reservation_id,
+            ("RESERVED", "EXPIRED_UNRESOLVED", "RECONCILIATION_REQUIRED"),
+            "RELEASED",
         )
 
     def _transition_budget_status(
