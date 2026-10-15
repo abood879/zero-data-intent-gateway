@@ -16,6 +16,11 @@ class UnifiedGovernanceEngine:
         )
         if self.budget_window_seconds <= 0:
             raise ValueError("GATEWAY_BUDGET_WINDOW_SECONDS must be positive.")
+        self.reservation_ttl_seconds = int(
+            os.getenv("GATEWAY_BUDGET_RESERVATION_TTL_SECONDS", "3600")
+        )
+        if self.reservation_ttl_seconds <= 0:
+            raise ValueError("GATEWAY_BUDGET_RESERVATION_TTL_SECONDS must be positive.")
 
         self.tool_permissions = {
             "database_drop": ["superadmin"],
@@ -72,10 +77,28 @@ class UnifiedGovernanceEngine:
                         role TEXT NOT NULL,
                         user_id TEXT NOT NULL,
                         amount TEXT NOT NULL,
-                        reserved_at REAL NOT NULL
+                        reserved_at REAL NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'COMMITTED',
+                        expires_at REAL
                     )
                     """
                 )
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(cumulative_budget_reservations)"
+                    )
+                }
+                if "status" not in columns:
+                    connection.execute(
+                        "ALTER TABLE cumulative_budget_reservations "
+                        "ADD COLUMN status TEXT NOT NULL DEFAULT 'COMMITTED'"
+                    )
+                if "expires_at" not in columns:
+                    connection.execute(
+                        "ALTER TABLE cumulative_budget_reservations "
+                        "ADD COLUMN expires_at REAL"
+                    )
                 connection.execute(
                     """
                     CREATE INDEX IF NOT EXISTS budget_reservations_identity_time
@@ -87,18 +110,38 @@ class UnifiedGovernanceEngine:
                 f"Could not initialize cumulative budget store at {self.budget_db_path}."
             ) from exc
 
-    def reserve_cumulative_budget(
+    def _cleanup_stale_reservations(
+        self,
+        connection: sqlite3.Connection,
+        now: float,
+        window_start: float,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE cumulative_budget_reservations
+            SET status = 'EXPIRED'
+            WHERE status = 'RESERVED' AND expires_at <= ?
+            """,
+            (now,),
+        )
+        connection.execute(
+            "DELETE FROM cumulative_budget_reservations WHERE reserved_at <= ?",
+            (window_start,),
+        )
+
+    def reserve_budget(
         self,
         role: str,
         user_id: str,
         amount: Decimal,
-    ) -> tuple[bool, Decimal]:
+    ) -> tuple[bool, Decimal, str | None]:
         budget_limit = self.role_budget_limits.get(role)
         if not user_id or budget_limit is None or not amount.is_finite() or amount <= 0:
-            return False, Decimal("0")
+            return False, Decimal("0"), None
 
         now = time.time()
         window_start = now - self.budget_window_seconds
+        reservation_id = uuid.uuid4().hex
         try:
             with sqlite3.connect(
                 self.budget_db_path,
@@ -107,17 +150,16 @@ class UnifiedGovernanceEngine:
             ) as connection:
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "DELETE FROM cumulative_budget_reservations WHERE reserved_at <= ?",
-                    (window_start,),
-                )
+                self._cleanup_stale_reservations(connection, now, window_start)
                 reservations = connection.execute(
                     """
                     SELECT amount
                     FROM cumulative_budget_reservations
                     WHERE role = ? AND user_id = ? AND reserved_at > ?
+                      AND (status = 'COMMITTED' OR
+                           (status = 'RESERVED' AND expires_at > ?))
                     """,
-                    (role, user_id, window_start),
+                    (role, user_id, window_start, now),
                 ).fetchall()
                 current_total = sum(
                     (Decimal(row[0]) for row in reservations),
@@ -126,19 +168,67 @@ class UnifiedGovernanceEngine:
                 next_total = current_total + amount
                 if next_total > budget_limit:
                     connection.commit()
-                    return False, current_total
+                    return False, current_total, None
                 connection.execute(
                     """
                     INSERT INTO cumulative_budget_reservations
-                        (reservation_id, role, user_id, amount, reserved_at)
-                    VALUES (?, ?, ?, ?, ?)
+                        (reservation_id, role, user_id, amount, reserved_at,
+                         status, expires_at)
+                    VALUES (?, ?, ?, ?, ?, 'RESERVED', ?)
                     """,
-                    (uuid.uuid4().hex, role, user_id, str(amount), now),
+                    (
+                        reservation_id,
+                        role,
+                        user_id,
+                        str(amount),
+                        now,
+                        now + self.reservation_ttl_seconds,
+                    ),
                 )
                 connection.commit()
-                return True, next_total
+                return True, next_total, reservation_id
         except (sqlite3.Error, InvalidOperation) as exc:
             raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
+
+    def commit_budget(self, reservation_id: str) -> bool:
+        return self._transition_budget_status(
+            reservation_id, ("RESERVED", "EXPIRED"), "COMMITTED"
+        )
+
+    def release_budget(self, reservation_id: str) -> bool:
+        return self._transition_budget_status(
+            reservation_id, ("RESERVED", "EXPIRED"), "RELEASED"
+        )
+
+    def _transition_budget_status(
+        self,
+        reservation_id: str,
+        allowed_statuses: tuple[str, ...],
+        next_status: str,
+    ) -> bool:
+        if not reservation_id:
+            return False
+        placeholders = ", ".join("?" for _ in allowed_statuses)
+        try:
+            with sqlite3.connect(
+                self.budget_db_path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    f"""
+                    UPDATE cumulative_budget_reservations
+                    SET status = ?
+                    WHERE reservation_id = ? AND status IN ({placeholders})
+                    """,
+                    (next_status, reservation_id, *allowed_statuses),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not transition cumulative budget reservation.") from exc
 
     def evaluate(self, payload: Dict[str, Any]) -> Tuple[int, List[str], Dict[str, Any]]:
         dof = 0

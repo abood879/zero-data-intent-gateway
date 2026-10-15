@@ -2,8 +2,11 @@ import asyncio
 import hashlib
 import json
 import multiprocessing
+import sqlite3
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from decimal import Decimal
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,6 +66,20 @@ def _consume_nonce_in_process(path: str, nonce: str, expires_at: float) -> bool:
 
 def trusted_context(role: str, user_id: str = "test-user") -> dict[str, str]:
     return gateway_main._issue_trusted_context({"role": role, "user_id": user_id})
+
+
+def budget_reservation_statuses(database_path, user_id: str) -> list[str]:
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT status
+            FROM cumulative_budget_reservations
+            WHERE user_id = ?
+            ORDER BY reserved_at, rowid
+            """,
+            (user_id,),
+        ).fetchall()
+    return [row[0] for row in rows]
 
 
 @pytest.fixture(autouse=True)
@@ -276,6 +293,42 @@ def test_tamper_evident_audit_ledger_hashes_parameters_atomically(tmp_path):
         for index in range(1, len(chain))
     )
     assert ledger.last_hash == chain[-1]["hash"]
+
+
+def test_audit_checkpoint_proof_identifies_verifiable_root(tmp_path):
+    ledger_path = tmp_path / "checkpoint-audit.jsonl"
+    ledger = AuditLedger(ledger_path)
+    stale_ledger = AuditLedger(ledger_path)
+    ledger.record(
+        "admin_execute",
+        {"operation": "checkpoint"},
+        {"role": "admin", "user_id": "checkpoint-user"},
+        "EXECUTION_SUCCESS",
+        dof=0,
+        decision="SUCCEEDED",
+    )
+
+    proof = stale_ledger.generate_checkpoint_proof()
+    latest_record = ledger.chain[-1]
+    payload = {
+        key: value for key, value in latest_record.items() if key != "hash"
+    }
+    expected_root = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert proof["block_sequence_index"] == len(ledger.chain)
+    assert proof["last_hash"] == expected_root == ledger.last_hash
+    timestamp = datetime.fromisoformat(
+        proof["timestamp_utc"].replace("Z", "+00:00")
+    )
+    assert timestamp.utcoffset() == timezone.utc.utcoffset(None)
 
 
 def test_audit_ledger_chain_is_continuous_across_processes(tmp_path):
@@ -506,6 +559,89 @@ def test_concurrent_transfers_cannot_exceed_cumulative_budget(
 
     assert results.count(True) == 1
     assert results.count(False) == 1
+
+
+def test_failed_transfer_releases_budget_for_next_valid_transaction(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "rollback-budgets.sqlite3"
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "5000.00"}',
+    )
+    engine_type = type(governance_engine)
+    engine = engine_type(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "rollback-audit.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "reservation-rollback-user"
+    context = trusted_context("finance_agent", user_id)
+
+    @protected_tool(tool_name="wire_transfer")
+    def failing_transfer(amount: str):
+        raise RuntimeError("transfer failed intentionally")
+
+    with pytest.raises(RuntimeError, match="transfer failed intentionally"):
+        failing_transfer(amount="4000.00", __context__=context)
+
+    assert budget_reservation_statuses(budget_path, user_id) == ["RELEASED"]
+
+    @protected_tool(tool_name="wire_transfer")
+    def valid_transfer(amount: str):
+        return "TRANSFERRED"
+
+    assert valid_transfer(amount="4000.00", __context__=context) == "TRANSFERRED"
+    assert set(budget_reservation_statuses(budget_path, user_id)) == {
+        "RELEASED",
+        "COMMITTED",
+    }
+
+
+def test_successful_transfer_commits_budget_reservation(tmp_path, monkeypatch):
+    budget_path = tmp_path / "committed-budgets.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "committed-audit.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "reservation-commit-user"
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str):
+        return "TRANSFERRED"
+
+    assert (
+        transfer(
+            amount="250.00",
+            __context__=trusted_context("finance_agent", user_id),
+        )
+        == "TRANSFERRED"
+    )
+    assert budget_reservation_statuses(budget_path, user_id) == ["COMMITTED"]
+
+
+def test_stale_budget_reservation_is_expired_and_ignored(tmp_path, monkeypatch):
+    budget_path = tmp_path / "expired-budgets.sqlite3"
+    monkeypatch.setenv("GATEWAY_BUDGET_RESERVATION_TTL_SECONDS", "1")
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    accepted, _, stale_reservation_id = engine.reserve_budget(
+        "finance_agent", "expired-reservation-user", Decimal("9000.00")
+    )
+    assert accepted and stale_reservation_id
+
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET expires_at = 0 "
+            "WHERE reservation_id = ?",
+            (stale_reservation_id,),
+        )
+
+    accepted, _, current_reservation_id = engine.reserve_budget(
+        "finance_agent", "expired-reservation-user", Decimal("9000.00")
+    )
+    assert accepted and current_reservation_id
+    assert budget_reservation_statuses(
+        budget_path, "expired-reservation-user"
+    ) == ["EXPIRED", "RESERVED"]
 
 
 def test_successful_execution_with_failed_audit_requires_reconciliation(

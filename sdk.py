@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from decimal import Decimal
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -280,6 +281,17 @@ class AuditLedger:
         with self._lock:
             return tuple(dict(record) for record in self._chain)
 
+    def generate_checkpoint_proof(self) -> dict[str, Any]:
+        with self._lock:
+            self._load_existing_chain()
+            return {
+                "last_hash": self._last_hash,
+                "block_sequence_index": len(self._chain),
+                "timestamp_utc": datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            }
+
     def _load_existing_chain(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -390,7 +402,7 @@ def _evaluate_and_authorize(
     identity: dict[str, Any],
     max_allowed_dof: int,
     step_up_approval_token: Any,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], str | None]:
     dof, reasons, metadata = governance_engine.evaluate(
         {
             "tool": tool,
@@ -416,52 +428,58 @@ def _evaluate_and_authorize(
     else:
         decision = "APPROVED"
 
-    if tool == "wire_transfer" and dof < 2 and (
-        not metadata.get("step_up_required") or step_up_approved
-    ):
-        amount = Decimal(str(parameters["amount"]))
-        reserved, cumulative_total = governance_engine.reserve_cumulative_budget(
-            str(identity["role"]),
-            str(identity["user_id"]),
-            amount,
-        )
-        if not reserved:
-            reasons.append(
-                "Cumulative financial budget exceeded for this identity and time window."
+    reservation_id = None
+    try:
+        if tool == "wire_transfer" and dof < 2 and (
+            not metadata.get("step_up_required") or step_up_approved
+        ):
+            amount = Decimal(str(parameters["amount"]))
+            reserved, cumulative_total, reservation_id = governance_engine.reserve_budget(
+                str(identity["role"]),
+                str(identity["user_id"]),
+                amount,
             )
-            dof = 2
-            decision = "DENIED_CUMULATIVE_BUDGET"
-        else:
-            metadata["cumulative_budget_total"] = str(cumulative_total)
+            if not reserved:
+                reasons.append(
+                    "Cumulative financial budget exceeded for this identity and time window."
+                )
+                dof = 2
+                decision = "DENIED_CUMULATIVE_BUDGET"
+            else:
+                metadata["cumulative_budget_total"] = str(cumulative_total)
 
-    audit_ledger.record(
-        tool,
-        parameters,
-        identity,
-        "POLICY_EVALUATED",
-        dof=dof,
-        decision=decision,
-    )
-
-    if dof >= 2:
-        raise SecurityViolationError(
-            f"Execution blocked under fail-closed policy (DoF={dof}): {reasons}"
+        audit_ledger.record(
+            tool,
+            parameters,
+            identity,
+            "POLICY_EVALUATED",
+            dof=dof,
+            decision=decision,
         )
-    if dof == 1 and metadata.get("step_up_required"):
-        if not step_up_approved:
+
+        if dof >= 2:
+            raise SecurityViolationError(
+                f"Execution blocked under fail-closed policy (DoF={dof}): {reasons}"
+            )
+        if dof == 1 and metadata.get("step_up_required"):
+            if not step_up_approved:
+                raise DisambiguationRequiredError(
+                    f"Valid step-up approval is required (DoF=1): {reasons}",
+                    reasons,
+                )
+        elif dof == 1 and not (
+            metadata.get("disambiguation_type") == "parameter_completion"
+            and max_allowed_dof >= 1
+        ):
             raise DisambiguationRequiredError(
-                f"Valid step-up approval is required (DoF=1): {reasons}",
+                f"Action halted pending authorized disambiguation (DoF=1): {reasons}",
                 reasons,
             )
-    elif dof == 1 and not (
-        metadata.get("disambiguation_type") == "parameter_completion"
-        and max_allowed_dof >= 1
-    ):
-        raise DisambiguationRequiredError(
-            f"Action halted pending authorized disambiguation (DoF=1): {reasons}",
-            reasons,
-        )
-    return dof, reasons
+        return dof, reasons, reservation_id
+    except BaseException:
+        if reservation_id:
+            governance_engine.release_budget(reservation_id)
+        raise
 
 
 def _run_with_audit(
@@ -472,6 +490,7 @@ def _run_with_audit(
     parameters: dict[str, Any],
     identity: dict[str, Any],
     dof: int,
+    reservation_id: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -502,9 +521,16 @@ def _run_with_audit(
                 ),
             )
         except Exception as exc:
+            if reservation_id:
+                governance_engine.release_budget(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc
+        if reservation_id:
+            if failed:
+                governance_engine.release_budget(reservation_id)
+            else:
+                governance_engine.commit_budget(reservation_id)
     return result
 
 
@@ -516,6 +542,7 @@ async def _run_async_with_audit(
     parameters: dict[str, Any],
     identity: dict[str, Any],
     dof: int,
+    reservation_id: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -546,9 +573,16 @@ async def _run_async_with_audit(
                 ),
             )
         except Exception as exc:
+            if reservation_id:
+                governance_engine.release_budget(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc
+        if reservation_id:
+            if failed:
+                governance_engine.release_budget(reservation_id)
+            else:
+                governance_engine.commit_budget(reservation_id)
     return result
 
 
@@ -580,7 +614,7 @@ def protected_tool(
             identity = validate_call_identity(raw_context)
             approval_token = call_kwargs.pop("step_up_approval_token", None)
             bound_args = signature.bind_partial(*args, **call_kwargs).arguments
-            dof, _ = _evaluate_and_authorize(
+            dof, _, reservation_id = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
                 identity,
@@ -588,7 +622,14 @@ def protected_tool(
                 approval_token,
             )
             return _run_with_audit(
-                func, args, call_kwargs, target_tool, bound_args, identity, dof
+                func,
+                args,
+                call_kwargs,
+                target_tool,
+                bound_args,
+                identity,
+                dof,
+                reservation_id,
             )
 
         @functools.wraps(func)
@@ -598,7 +639,7 @@ def protected_tool(
             identity = validate_call_identity(raw_context)
             approval_token = call_kwargs.pop("step_up_approval_token", None)
             bound_args = signature.bind_partial(*args, **call_kwargs).arguments
-            dof, _ = _evaluate_and_authorize(
+            dof, _, reservation_id = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
                 identity,
@@ -606,7 +647,14 @@ def protected_tool(
                 approval_token,
             )
             return await _run_async_with_audit(
-                func, args, call_kwargs, target_tool, bound_args, identity, dof
+                func,
+                args,
+                call_kwargs,
+                target_tool,
+                bound_args,
+                identity,
+                dof,
+                reservation_id,
             )
 
         if inspect.iscoroutinefunction(func):
