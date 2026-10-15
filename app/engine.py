@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
+class BudgetStateConflictError(RuntimeError):
+    """Raised when a reservation is no longer eligible for a state transition."""
+
+
 class UnifiedGovernanceEngine:
     def __init__(self, budget_db_path: str | Path | None = None):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
@@ -125,7 +129,10 @@ class UnifiedGovernanceEngine:
             (now,),
         )
         connection.execute(
-            "DELETE FROM cumulative_budget_reservations WHERE reserved_at <= ?",
+            """
+            DELETE FROM cumulative_budget_reservations
+            WHERE reserved_at <= ? AND status != 'RECONCILIATION_REQUIRED'
+            """,
             (window_start,),
         )
 
@@ -155,9 +162,11 @@ class UnifiedGovernanceEngine:
                     """
                     SELECT amount
                     FROM cumulative_budget_reservations
-                    WHERE role = ? AND user_id = ? AND reserved_at > ?
-                      AND (status = 'COMMITTED' OR
-                           (status = 'RESERVED' AND expires_at > ?))
+                                        WHERE role = ? AND user_id = ?
+                                            AND (status = 'RECONCILIATION_REQUIRED' OR
+                                                     (reserved_at > ? AND
+                                                        (status = 'COMMITTED' OR
+                                                         (status = 'RESERVED' AND expires_at > ?))))
                     """,
                     (role, user_id, window_start, now),
                 ).fetchall()
@@ -191,9 +200,54 @@ class UnifiedGovernanceEngine:
             raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
 
     def commit_budget(self, reservation_id: str) -> bool:
-        return self._transition_budget_status(
-            reservation_id, ("RESERVED", "EXPIRED"), "COMMITTED"
+        if not reservation_id:
+            raise BudgetStateConflictError("Budget reservation ID is required.")
+        now = time.time()
+        try:
+            with sqlite3.connect(
+                self.budget_db_path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE cumulative_budget_reservations
+                    SET status = 'COMMITTED'
+                    WHERE reservation_id = ? AND status = 'RESERVED'
+                      AND expires_at > ?
+                    """,
+                    (reservation_id, now),
+                )
+                if cursor.rowcount == 1:
+                    connection.commit()
+                    return True
+                connection.execute(
+                    """
+                    UPDATE cumulative_budget_reservations
+                    SET status = 'EXPIRED'
+                    WHERE reservation_id = ? AND status = 'RESERVED'
+                      AND expires_at <= ?
+                    """,
+                    (reservation_id, now),
+                )
+                connection.commit()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not commit cumulative budget reservation.") from exc
+        raise BudgetStateConflictError(
+            f"Budget reservation {reservation_id!r} is not in a committable state."
         )
+
+    def flag_for_reconciliation(self, reservation_id: str) -> bool:
+        transitioned = self._transition_budget_status(
+            reservation_id, ("RESERVED", "EXPIRED"), "RECONCILIATION_REQUIRED"
+        )
+        if not transitioned:
+            raise BudgetStateConflictError(
+                f"Budget reservation {reservation_id!r} cannot be flagged for reconciliation."
+            )
+        return True
 
     def release_budget(self, reservation_id: str) -> bool:
         return self._transition_budget_status(

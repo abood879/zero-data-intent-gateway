@@ -522,7 +522,10 @@ def _run_with_audit(
             )
         except Exception as exc:
             if reservation_id:
-                governance_engine.release_budget(reservation_id)
+                if failed:
+                    governance_engine.release_budget(reservation_id)
+                else:
+                    governance_engine.flag_for_reconciliation(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc
@@ -574,7 +577,10 @@ async def _run_async_with_audit(
             )
         except Exception as exc:
             if reservation_id:
-                governance_engine.release_budget(reservation_id)
+                if failed:
+                    governance_engine.release_budget(reservation_id)
+                else:
+                    governance_engine.flag_for_reconciliation(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc

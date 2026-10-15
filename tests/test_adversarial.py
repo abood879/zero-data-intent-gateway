@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main as gateway_main
-from app.engine import governance_engine
+from app.engine import BudgetStateConflictError, governance_engine
 from app.main import app
 import sdk
 from sdk import (
@@ -644,6 +644,28 @@ def test_stale_budget_reservation_is_expired_and_ignored(tmp_path, monkeypatch):
     ) == ["EXPIRED", "RESERVED"]
 
 
+def test_commit_rejects_expired_budget_reservation(tmp_path):
+    budget_path = tmp_path / "stale-commit-budgets.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    accepted, _, reservation_id = engine.reserve_budget(
+        "finance_agent", "stale-commit-user", Decimal("100.00")
+    )
+    assert accepted and reservation_id
+
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET status = 'EXPIRED' "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+
+    with pytest.raises(BudgetStateConflictError):
+        engine.commit_budget(reservation_id)
+    assert budget_reservation_statuses(budget_path, "stale-commit-user") == [
+        "EXPIRED"
+    ]
+
+
 def test_successful_execution_with_failed_audit_requires_reconciliation(
     tmp_path, monkeypatch
 ):
@@ -674,6 +696,87 @@ def test_successful_execution_with_failed_audit_requires_reconciliation(
     assert executed == [True]
     assert exc.value.status == "RECONCILIATION_REQUIRED"
     assert exc.value.reconciliation_required is True
+
+
+def test_successful_transfer_with_audit_failure_locks_cumulative_budget(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "audit-failure-budgets.sqlite3"
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "5000.00"}',
+    )
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "audit-failure-budget-ledger.jsonl")
+    original_record = ledger.record
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "audit-failure-budget-user"
+    context = trusted_context("finance_agent", user_id)
+
+    def fail_success_record(*args, **kwargs):
+        if args[3] == "EXECUTION_SUCCESS":
+            raise AuditLedgerError("success event could not be persisted")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "record", fail_success_record)
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str):
+        return "TRANSFERRED"
+
+    with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
+        transfer(amount="4000.00", __context__=context)
+
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET reserved_at = 0 "
+            "WHERE user_id = ?",
+            (user_id,),
+        )
+
+    with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
+        transfer(amount="2000.00", __context__=context)
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_success_with_audit_failure_flags_reconciliation(
+    tmp_path, monkeypatch
+):
+    budget_path = tmp_path / "async-audit-failure-budgets.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "async-audit-failure-ledger.jsonl")
+    original_record = ledger.record
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "async-audit-failure-user"
+
+    def fail_success_record(*args, **kwargs):
+        if args[3] == "EXECUTION_SUCCESS":
+            raise AuditLedgerError("success event could not be persisted")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "record", fail_success_record)
+
+    @protected_tool(tool_name="wire_transfer")
+    async def transfer(amount: str):
+        return "TRANSFERRED"
+
+    with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
+        await transfer(
+            amount="4000.00",
+            __context__=trusted_context("finance_agent", user_id),
+        )
+
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
 
 
 def test_tool_execution_failure_is_written_to_persistent_ledger(
