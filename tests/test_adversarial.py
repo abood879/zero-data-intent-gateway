@@ -18,6 +18,7 @@ import sdk
 from sdk import (
     AuditLedger,
     AuditLedgerError,
+    ConfirmedToolFailureError,
     CriticalAuditFailureError,
     DisambiguationRequiredError,
     IdentitySpoofingError,
@@ -579,9 +580,9 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
 
     @protected_tool(tool_name="wire_transfer")
     def failing_transfer(amount: str):
-        raise RuntimeError("transfer failed intentionally")
+        raise ConfirmedToolFailureError("transfer failed before mutation")
 
-    with pytest.raises(RuntimeError, match="transfer failed intentionally"):
+    with pytest.raises(ConfirmedToolFailureError, match="before mutation"):
         failing_transfer(amount="4000.00", __context__=context)
 
     assert budget_reservation_statuses(budget_path, user_id) == ["RELEASED"]
@@ -595,6 +596,79 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
         "RELEASED",
         "COMMITTED",
     }
+
+
+def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
+    budget_path = tmp_path / "ambiguous-timeout-budgets.sqlite3"
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "5000.00"}',
+    )
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "ambiguous-timeout-ledger.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "ambiguous-timeout-user"
+    context = trusted_context("finance_agent", user_id)
+
+    @protected_tool(tool_name="wire_transfer")
+    def timed_out_transfer(amount: str):
+        raise TimeoutError("connection lost after external debit")
+
+    with pytest.raises(TimeoutError, match="after external debit"):
+        timed_out_transfer(amount="4000.00", __context__=context)
+
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
+    assert ledger.chain[-1]["status"] == "EXECUTION_UNCERTAIN"
+    assert ledger.chain[-1]["decision"] == "OUTCOME_UNKNOWN"
+
+    @protected_tool(tool_name="wire_transfer")
+    def valid_transfer(amount: str):
+        return "TRANSFERRED"
+
+    with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
+        valid_transfer(amount="2000.00", __context__=context)
+
+
+def test_success_after_reservation_expiry_is_reconciled(tmp_path, monkeypatch):
+    budget_path = tmp_path / "late-commit-budgets.sqlite3"
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": "5000.00"}',
+    )
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "late-commit-ledger.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "late-commit-user"
+    context = trusted_context("finance_agent", user_id)
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer_after_expiry(amount: str):
+        with sqlite3.connect(budget_path) as connection:
+            connection.execute(
+                "UPDATE cumulative_budget_reservations SET expires_at = 0 "
+                "WHERE user_id = ? AND status = 'RESERVED'",
+                (user_id,),
+            )
+        return "TRANSFERRED"
+
+    with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
+        transfer_after_expiry(amount="4000.00", __context__=context)
+
+    assert budget_reservation_statuses(budget_path, user_id) == [
+        "RECONCILIATION_REQUIRED"
+    ]
+    assert ledger.chain[-1]["status"] == "COMMIT_CONFLICT_RECONCILIATION"
+
+    @protected_tool(tool_name="wire_transfer")
+    def valid_transfer(amount: str):
+        return "TRANSFERRED"
+
+    with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
+        valid_transfer(amount="2000.00", __context__=context)
 
 
 def test_successful_transfer_commits_budget_reservation(tmp_path, monkeypatch):
@@ -801,8 +875,9 @@ def test_tool_execution_failure_is_written_to_persistent_ledger(
     events = [json.loads(line) for line in ledger_path.read_text().splitlines()]
     assert [event["status"] for event in events] == [
         "POLICY_EVALUATED",
-        "EXECUTION_FAILED",
+        "EXECUTION_UNCERTAIN",
     ]
+    assert events[-1]["decision"] == "OUTCOME_UNKNOWN"
     assert events[-1]["exception_summary"] == {
         "type": "ValueError",
         "message": "execution failed for test",

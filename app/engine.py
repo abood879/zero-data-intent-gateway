@@ -131,7 +131,8 @@ class UnifiedGovernanceEngine:
         connection.execute(
             """
             DELETE FROM cumulative_budget_reservations
-            WHERE reserved_at <= ? AND status != 'RECONCILIATION_REQUIRED'
+                        WHERE reserved_at <= ?
+                            AND status NOT IN ('RECONCILIATION_REQUIRED', 'EXPIRED')
             """,
             (window_start,),
         )

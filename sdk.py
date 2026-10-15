@@ -16,11 +16,15 @@ from typing import Any, Callable, Optional
 
 import redis
 
-from app.engine import governance_engine
+from app.engine import BudgetStateConflictError, governance_engine
 
 
 class GatewaySecurityError(Exception):
     pass
+
+
+class ConfirmedToolFailureError(GatewaySecurityError):
+    """A proven pre-execution or non-mutating tool abort safe to roll back."""
 
 
 class SecurityViolationError(GatewaySecurityError):
@@ -396,6 +400,41 @@ class AuditLedger:
 audit_ledger = AuditLedger()
 
 
+def _commit_budget_after_execution(
+    reservation_id: str,
+    tool: str,
+    parameters: dict[str, Any],
+    identity: dict[str, Any],
+    dof: int,
+) -> None:
+    try:
+        governance_engine.commit_budget(reservation_id)
+    except BudgetStateConflictError as exc:
+        governance_engine.flag_for_reconciliation(reservation_id)
+        try:
+            audit_ledger.record(
+                tool,
+                parameters,
+                identity,
+                "COMMIT_CONFLICT_RECONCILIATION",
+                dof=dof,
+                decision="RECONCILIATION_REQUIRED",
+                exception_summary={
+                    "type": type(exc).__name__,
+                    "message": str(exc)[:500],
+                },
+            )
+        except Exception as audit_exc:
+            raise CriticalAuditFailureError(
+                "Budget commit conflicted after execution and conflict audit failed; "
+                "RECONCILIATION_REQUIRED."
+            ) from audit_exc
+        raise CriticalAuditFailureError(
+            "Budget commit conflicted after successful execution; "
+            "RECONCILIATION_REQUIRED."
+        ) from exc
+
+
 def _evaluate_and_authorize(
     tool: str,
     parameters: dict[str, Any],
@@ -502,14 +541,32 @@ def _run_with_audit(
         raise
     finally:
         failed = execution_error is not None
+        confirmed_failure = isinstance(execution_error, ConfirmedToolFailureError)
+        if reservation_id and failed:
+            if confirmed_failure:
+                governance_engine.release_budget(reservation_id)
+            else:
+                governance_engine.flag_for_reconciliation(reservation_id)
         try:
             audit_ledger.record(
                 tool,
                 parameters,
                 identity,
-                "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
+                (
+                    "EXECUTION_FAILED"
+                    if confirmed_failure
+                    else "EXECUTION_UNCERTAIN"
+                    if failed
+                    else "EXECUTION_SUCCESS"
+                ),
                 dof=dof,
-                decision="FAILED" if failed else "SUCCEEDED",
+                decision=(
+                    "FAILED"
+                    if confirmed_failure
+                    else "OUTCOME_UNKNOWN"
+                    if failed
+                    else "SUCCEEDED"
+                ),
                 execution_latency=time.perf_counter() - started_at,
                 exception_summary=(
                     {
@@ -521,19 +578,15 @@ def _run_with_audit(
                 ),
             )
         except Exception as exc:
-            if reservation_id:
-                if failed:
-                    governance_engine.release_budget(reservation_id)
-                else:
-                    governance_engine.flag_for_reconciliation(reservation_id)
+            if reservation_id and not failed:
+                governance_engine.flag_for_reconciliation(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc
-        if reservation_id:
-            if failed:
-                governance_engine.release_budget(reservation_id)
-            else:
-                governance_engine.commit_budget(reservation_id)
+        if reservation_id and not failed:
+            _commit_budget_after_execution(
+                reservation_id, tool, parameters, identity, dof
+            )
     return result
 
 
@@ -557,14 +610,32 @@ async def _run_async_with_audit(
         raise
     finally:
         failed = execution_error is not None
+        confirmed_failure = isinstance(execution_error, ConfirmedToolFailureError)
+        if reservation_id and failed:
+            if confirmed_failure:
+                governance_engine.release_budget(reservation_id)
+            else:
+                governance_engine.flag_for_reconciliation(reservation_id)
         try:
             audit_ledger.record(
                 tool,
                 parameters,
                 identity,
-                "EXECUTION_FAILED" if failed else "EXECUTION_SUCCESS",
+                (
+                    "EXECUTION_FAILED"
+                    if confirmed_failure
+                    else "EXECUTION_UNCERTAIN"
+                    if failed
+                    else "EXECUTION_SUCCESS"
+                ),
                 dof=dof,
-                decision="FAILED" if failed else "SUCCEEDED",
+                decision=(
+                    "FAILED"
+                    if confirmed_failure
+                    else "OUTCOME_UNKNOWN"
+                    if failed
+                    else "SUCCEEDED"
+                ),
                 execution_latency=time.perf_counter() - started_at,
                 exception_summary=(
                     {
@@ -576,19 +647,15 @@ async def _run_async_with_audit(
                 ),
             )
         except Exception as exc:
-            if reservation_id:
-                if failed:
-                    governance_engine.release_budget(reservation_id)
-                else:
-                    governance_engine.flag_for_reconciliation(reservation_id)
+            if reservation_id and not failed:
+                governance_engine.flag_for_reconciliation(reservation_id)
             raise CriticalAuditFailureError(
                 "Execution audit could not be persisted; RECONCILIATION_REQUIRED."
             ) from exc
-        if reservation_id:
-            if failed:
-                governance_engine.release_budget(reservation_id)
-            else:
-                governance_engine.commit_budget(reservation_id)
+        if reservation_id and not failed:
+            _commit_budget_after_execution(
+                reservation_id, tool, parameters, identity, dof
+            )
     return result
 
 
