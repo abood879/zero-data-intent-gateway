@@ -19,6 +19,7 @@ import redis
 
 from app.engine import (
     BudgetStateConflictError,
+    IdempotencyConflictError,
     ReconciliationProofRequiredError,
     SecurityViolationError,
     governance_engine,
@@ -205,6 +206,9 @@ class StepUpNonceStore:
             raise AuditLedgerError(
                 "Could not atomically consume step-up approval nonce in SQLite."
             ) from exc
+
+    def consume_nonce(self, nonce: str, expires_at: float) -> bool:
+        return self.consume(nonce, expires_at)
 
 
 step_up_nonce_store = StepUpNonceStore()
@@ -421,6 +425,7 @@ def reconcile_budget_reservation(
         proof,
         operator_id,
         operator_context,
+        step_up_nonce_store,
     )
 
 
@@ -430,9 +435,10 @@ def _commit_budget_after_execution(
     parameters: dict[str, Any],
     identity: dict[str, Any],
     dof: int,
+    execution_token: str | None,
 ) -> None:
     try:
-        governance_engine.commit_budget(reservation_id)
+        governance_engine.commit_budget(reservation_id, execution_token)
     except BudgetStateConflictError as exc:
         governance_engine.flag_for_reconciliation(reservation_id)
         try:
@@ -465,7 +471,7 @@ def _evaluate_and_authorize(
     identity: dict[str, Any],
     max_allowed_dof: int,
     step_up_approval_token: Any,
-) -> tuple[int, list[str], str | None]:
+) -> tuple[int, list[str], str | None, str | None, str | None]:
     dof, reasons, metadata = governance_engine.evaluate(
         {
             "tool": tool,
@@ -492,6 +498,8 @@ def _evaluate_and_authorize(
         decision = "APPROVED"
 
     reservation_id = None
+    execution_token = None
+    resolved_idempotency_key = None
     try:
         if tool == "wire_transfer" and dof < 2 and (
             not metadata.get("step_up_required") or step_up_approved
@@ -502,12 +510,20 @@ def _evaluate_and_authorize(
                 idempotency_key = uuid.uuid4().hex
             elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
                 raise ValueError("Idempotency key must be a non-empty string.")
-            reserved, cumulative_total, reservation_id = governance_engine.reserve_budget(
+            currency = parameters.get("currency", "USD")
+            (
+                reserved,
+                cumulative_total,
+                reservation_id,
+                execution_token,
+            ) = governance_engine.reserve_budget(
                 str(identity["role"]),
                 str(identity["user_id"]),
                 amount,
                 idempotency_key,
+                currency,
             )
+            resolved_idempotency_key = idempotency_key
             if not reserved:
                 reasons.append(
                     "Cumulative financial budget exceeded for this identity and time window."
@@ -544,7 +560,13 @@ def _evaluate_and_authorize(
                 f"Action halted pending authorized disambiguation (DoF=1): {reasons}",
                 reasons,
             )
-        return dof, reasons, reservation_id
+        return (
+            dof,
+            reasons,
+            reservation_id,
+            execution_token,
+            resolved_idempotency_key,
+        )
     except BaseException:
         if reservation_id:
             governance_engine.release_budget(reservation_id)
@@ -560,6 +582,7 @@ def _run_with_audit(
     identity: dict[str, Any],
     dof: int,
     reservation_id: str | None,
+    execution_token: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -615,7 +638,7 @@ def _run_with_audit(
             ) from exc
         if reservation_id and not failed:
             _commit_budget_after_execution(
-                reservation_id, tool, parameters, identity, dof
+                reservation_id, tool, parameters, identity, dof, execution_token
             )
     return result
 
@@ -629,6 +652,7 @@ async def _run_async_with_audit(
     identity: dict[str, Any],
     dof: int,
     reservation_id: str | None,
+    execution_token: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -684,9 +708,51 @@ async def _run_async_with_audit(
             ) from exc
         if reservation_id and not failed:
             _commit_budget_after_execution(
-                reservation_id, tool, parameters, identity, dof
+                reservation_id, tool, parameters, identity, dof, execution_token
             )
     return result
+
+
+def _bound_tool_parameters(
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    bound = signature.bind_partial(*args, **kwargs)
+    parameters: dict[str, Any] = {}
+    for name, value in bound.arguments.items():
+        parameter = signature.parameters[name]
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            parameters.update(value)
+        else:
+            parameters[name] = value
+    return parameters
+
+
+def _inject_idempotency_key(
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    idempotency_key: str | None,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    if idempotency_key is None:
+        return args, kwargs
+    idempotency_parameter = signature.parameters.get("idempotency_key")
+    if idempotency_parameter is not None and idempotency_parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        bound = signature.bind_partial(*args, **kwargs)
+        bound.arguments["idempotency_key"] = idempotency_key
+        return bound.args, bound.kwargs
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        injected_kwargs = kwargs.copy()
+        injected_kwargs["idempotency_key"] = idempotency_key
+        return args, injected_kwargs
+    return args, kwargs
 
 
 def protected_tool(
@@ -716,23 +782,36 @@ def protected_tool(
             raw_context = call_kwargs.pop("__context__", None)
             identity = validate_call_identity(raw_context)
             approval_token = call_kwargs.pop("step_up_approval_token", None)
-            bound_args = signature.bind_partial(*args, **call_kwargs).arguments
-            dof, _, reservation_id = _evaluate_and_authorize(
+            bound_args = _bound_tool_parameters(signature, args, call_kwargs)
+            (
+                dof,
+                _,
+                reservation_id,
+                execution_token,
+                resolved_idempotency_key,
+            ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
                 identity,
                 max_allowed_dof,
                 approval_token,
             )
-            return _run_with_audit(
-                func,
+            tool_args, tool_kwargs = _inject_idempotency_key(
+                signature,
                 args,
                 call_kwargs,
+                resolved_idempotency_key,
+            )
+            return _run_with_audit(
+                func,
+                tool_args,
+                tool_kwargs,
                 target_tool,
                 bound_args,
                 identity,
                 dof,
                 reservation_id,
+                execution_token,
             )
 
         @functools.wraps(func)
@@ -741,23 +820,36 @@ def protected_tool(
             raw_context = call_kwargs.pop("__context__", None)
             identity = validate_call_identity(raw_context)
             approval_token = call_kwargs.pop("step_up_approval_token", None)
-            bound_args = signature.bind_partial(*args, **call_kwargs).arguments
-            dof, _, reservation_id = _evaluate_and_authorize(
+            bound_args = _bound_tool_parameters(signature, args, call_kwargs)
+            (
+                dof,
+                _,
+                reservation_id,
+                execution_token,
+                resolved_idempotency_key,
+            ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
                 identity,
                 max_allowed_dof,
                 approval_token,
             )
-            return await _run_async_with_audit(
-                func,
+            tool_args, tool_kwargs = _inject_idempotency_key(
+                signature,
                 args,
                 call_kwargs,
+                resolved_idempotency_key,
+            )
+            return await _run_async_with_audit(
+                func,
+                tool_args,
+                tool_kwargs,
                 target_tool,
                 bound_args,
                 identity,
                 dof,
                 reservation_id,
+                execution_token,
             )
 
         if inspect.iscoroutinefunction(func):

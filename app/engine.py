@@ -24,6 +24,10 @@ class ReconciliationProofRequiredError(BudgetStateConflictError):
     """Raised when a reservation requires audited administrative resolution."""
 
 
+class IdempotencyConflictError(RuntimeError):
+    """Raised when an idempotency key has already been used for a reservation."""
+
+
 class UnifiedGovernanceEngine:
     def __init__(self, budget_db_path: str | Path | None = None):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
@@ -97,7 +101,9 @@ class UnifiedGovernanceEngine:
                         status TEXT NOT NULL DEFAULT 'COMMITTED',
                         expires_at REAL,
                         committed_at TEXT,
-                        idempotency_key TEXT
+                        idempotency_key TEXT UNIQUE,
+                        execution_token TEXT,
+                        currency TEXT NOT NULL DEFAULT 'USD'
                     )
                     """
                 )
@@ -127,6 +133,23 @@ class UnifiedGovernanceEngine:
                         "ALTER TABLE cumulative_budget_reservations "
                         "ADD COLUMN idempotency_key TEXT"
                     )
+                if "execution_token" not in columns:
+                    connection.execute(
+                        "ALTER TABLE cumulative_budget_reservations "
+                        "ADD COLUMN execution_token TEXT"
+                    )
+                if "currency" not in columns:
+                    connection.execute(
+                        "ALTER TABLE cumulative_budget_reservations "
+                        "ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'"
+                    )
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_idempotency_key
+                    ON cumulative_budget_reservations (idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    """
+                )
                 connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
@@ -186,14 +209,18 @@ class UnifiedGovernanceEngine:
         user_id: str,
         amount: Decimal,
         idempotency_key: str | None = None,
-    ) -> tuple[bool, Decimal, str | None]:
+        currency: str = "USD",
+    ) -> tuple[bool, Decimal, str | None, str | None]:
         budget_limit = self.role_budget_limits.get(role)
         if not user_id or budget_limit is None or not amount.is_finite() or amount <= 0:
-            return False, Decimal("0"), None
+            return False, Decimal("0"), None, None
         if idempotency_key is None:
             idempotency_key = uuid.uuid4().hex
         elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("Idempotency key must be a non-empty string.")
+        if not isinstance(currency, str) or not currency.strip():
+            raise ValueError("Currency must be a non-empty string.")
+        currency = currency.strip().upper()
 
         now = time.time()
         window_start = now - self.budget_window_seconds
@@ -201,6 +228,7 @@ class UnifiedGovernanceEngine:
             window_start, timezone.utc
         ).isoformat().replace("+00:00", "Z")
         reservation_id = uuid.uuid4().hex
+        execution_token = uuid.uuid4().hex
         try:
             with sqlite3.connect(
                 self.budget_db_path,
@@ -228,13 +256,14 @@ class UnifiedGovernanceEngine:
                 next_total = current_total + amount
                 if next_total > budget_limit:
                     connection.commit()
-                    return False, current_total, None
+                    return False, current_total, None, None
                 connection.execute(
                     """
                     INSERT INTO cumulative_budget_reservations
                         (reservation_id, role, user_id, amount, reserved_at,
-                        status, expires_at, idempotency_key)
-                    VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?)
+                         status, expires_at, idempotency_key, execution_token,
+                         currency)
+                    VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?, ?, ?)
                     """,
                     (
                         reservation_id,
@@ -244,14 +273,26 @@ class UnifiedGovernanceEngine:
                         now,
                         now + self.reservation_ttl_seconds,
                         idempotency_key,
+                        execution_token,
+                        currency,
                     ),
                 )
                 connection.commit()
-                return True, next_total, reservation_id
+                return True, next_total, reservation_id, execution_token
+        except sqlite3.IntegrityError as exc:
+            if "idempotency_key" in str(exc):
+                raise IdempotencyConflictError(
+                    f"Idempotency key {idempotency_key!r} is already reserved."
+                ) from exc
+            raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
         except (sqlite3.Error, InvalidOperation) as exc:
             raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
 
-    def commit_budget(self, reservation_id: str) -> bool:
+    def commit_budget(
+        self,
+        reservation_id: str,
+        execution_token: str | None = None,
+    ) -> bool:
         if not reservation_id:
             raise BudgetStateConflictError("Budget reservation ID is required.")
         now = time.time()
@@ -280,9 +321,10 @@ class UnifiedGovernanceEngine:
                     UPDATE cumulative_budget_reservations
                                         SET status = 'COMMITTED', committed_at = ?
                     WHERE reservation_id = ?
-                      AND status IN ('RESERVED', 'EXPIRED_UNRESOLVED')
+                                            AND (status = 'RESERVED' OR
+                                                     (status = 'EXPIRED_UNRESOLVED' AND execution_token = ?))
                     """,
-                                        (committed_at, reservation_id),
+                                        (committed_at, reservation_id, execution_token),
                 )
                 if cursor.rowcount == 1:
                     connection.commit()
@@ -355,6 +397,7 @@ class UnifiedGovernanceEngine:
         proof: dict[str, Any],
         operator_id: str,
         operator_context: Any,
+        nonce_store: Any,
     ) -> bool:
         operator = self.verify_operator_context(operator_context)
         if not isinstance(operator_id, str) or operator_id != operator[
@@ -370,6 +413,13 @@ class UnifiedGovernanceEngine:
             raise ValueError("Resolution must be 'RELEASED' or 'COMMITTED'.")
         if not isinstance(proof, dict) or not proof:
             raise ValueError("Reconciliation proof must be a non-empty dictionary.")
+        if operator.get("target_reservation_id") != reservation_id:
+            raise SecurityViolationError(
+                "Operator context is not scoped to this reservation."
+            )
+        nonce = operator.get("nonce")
+        if not isinstance(nonce, str) or not nonce.strip():
+            raise SecurityViolationError("Operator context requires a nonce.")
         if proof.get("provider_status") not in (
             "CONFIRMED_EXECUTED",
             "CONFIRMED_NOT_EXECUTED",
@@ -389,35 +439,82 @@ class UnifiedGovernanceEngine:
             raise ReconciliationProofRequiredError(
                 "Provider status does not match the requested resolution."
             )
-        proof_payload = {
-            key: value
-            for key, value in proof.items()
-            if key not in {"provider_signature", "proof_payload_hash"}
-        }
-        try:
-            canonical_proof_payload = json.dumps(
-                proof_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
+        if not isinstance(proof.get("provider_ref"), str) or not proof[
+            "provider_ref"
+        ].strip():
             raise ReconciliationProofRequiredError(
-                "Provider proof must contain canonical JSON data."
+                "Provider proof must include a non-empty provider_ref."
+            )
+        if not reservation_id:
+            raise ValueError("Reservation ID must be non-empty.")
+        try:
+            proof_amount = Decimal(str(proof.get("amount")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ReconciliationProofRequiredError(
+                "Provider proof amount is invalid."
             ) from exc
-        signature_valid = False
+        if not proof_amount.is_finite():
+            raise ReconciliationProofRequiredError("Provider proof amount is invalid.")
+        try:
+            with sqlite3.connect(self.budget_db_path, timeout=10) as connection:
+                reservation = connection.execute(
+                    """
+                    SELECT status, idempotency_key, amount, currency
+                    FROM cumulative_budget_reservations
+                    WHERE reservation_id = ?
+                    """,
+                    (reservation_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not load reservation for reconciliation.") from exc
+        if not reservation or reservation[0] not in {
+            "EXPIRED_UNRESOLVED",
+            "RECONCILIATION_REQUIRED",
+        }:
+            raise BudgetStateConflictError(
+                f"Budget reservation {reservation_id!r} is not unresolved."
+            )
+        bound_key = reservation[1]
+        if (
+            not isinstance(bound_key, str)
+            or not bound_key
+            or not hmac.compare_digest(proof["idempotency_key"], bound_key)
+        ):
+            raise ReconciliationProofRequiredError(
+                "Provider proof idempotency key does not match the reservation."
+            )
+        try:
+            reserved_amount = Decimal(reservation[2])
+        except InvalidOperation as exc:
+            raise RuntimeError("Stored reservation amount is invalid.") from exc
+        if proof_amount != reserved_amount:
+            raise ReconciliationProofRequiredError(
+                "Provider proof amount does not match the reservation."
+            )
+        currency = str(reservation[3] or "USD").upper()
+        proof_currency = proof.get("currency")
+        if not isinstance(proof_currency, str) or proof_currency.upper() != currency:
+            raise ReconciliationProofRequiredError(
+                "Provider proof currency does not match the reservation."
+            )
+        provider_ref = proof["provider_ref"].strip()
+        canonical_proof = (
+            f"{bound_key}:{reservation_id}:{reserved_amount}:{currency}:"
+            f"{provider_ref}:{proof['provider_status']}"
+        ).encode("utf-8")
         provider_signature = proof.get("provider_signature")
         provider_secret = os.getenv("GATEWAY_PROVIDER_PROOF_HMAC_SECRET")
+        signature_valid = False
         if (
             isinstance(provider_signature, str)
-            and provider_secret
-            and len(provider_signature) == hashlib.sha256().digest_size * 2
             and provider_signature.isascii()
+            and len(provider_signature) == hashlib.sha256().digest_size * 2
+            and isinstance(provider_secret, str)
+            and provider_secret
         ):
             expected_signature = hmac.new(
                 provider_secret.encode("utf-8"),
-                canonical_proof_payload,
+                canonical_proof,
                 hashlib.sha256,
             ).hexdigest()
             signature_valid = hmac.compare_digest(
@@ -427,8 +524,6 @@ class UnifiedGovernanceEngine:
             raise ReconciliationProofRequiredError(
                 "Provider proof HMAC signature is invalid."
             )
-        if not reservation_id:
-            raise ValueError("Reservation ID must be non-empty.")
         try:
             proof_json = json.dumps(
                 proof,
@@ -440,6 +535,12 @@ class UnifiedGovernanceEngine:
         except (TypeError, ValueError) as exc:
             raise ValueError("Reconciliation proof must be valid JSON data.") from exc
 
+        expires_at = float(operator["expires_at"])
+        if not nonce_store.consume_nonce(nonce, expires_at):
+            raise SecurityViolationError(
+                "Operator context nonce has already been consumed."
+            )
+
         try:
             with sqlite3.connect(
                 self.budget_db_path,
@@ -450,7 +551,7 @@ class UnifiedGovernanceEngine:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
-                    SELECT status, idempotency_key
+                    SELECT status, idempotency_key, amount, currency
                     FROM cumulative_budget_reservations
                     WHERE reservation_id = ?
                     """,
@@ -464,16 +565,10 @@ class UnifiedGovernanceEngine:
                     raise BudgetStateConflictError(
                         f"Budget reservation {reservation_id!r} is not unresolved."
                     )
-                if (
-                    not isinstance(row[1], str)
-                    or not row[1]
-                    or not hmac.compare_digest(
-                        proof["idempotency_key"], row[1]
-                    )
-                ):
+                if row[1] != bound_key or row[2] != reservation[2] or row[3] != reservation[3]:
                     connection.rollback()
                     raise ReconciliationProofRequiredError(
-                        "Provider proof idempotency key does not match the reservation."
+                        "Reservation attributes changed during reconciliation."
                     )
                 previous_status = row[0]
                 committed_at = (
