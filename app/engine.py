@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import hmac
+import math
 import sqlite3
 import time
 import uuid
@@ -95,7 +96,8 @@ class UnifiedGovernanceEngine:
                         reserved_at REAL NOT NULL,
                         status TEXT NOT NULL DEFAULT 'COMMITTED',
                         expires_at REAL,
-                        committed_at TEXT
+                        committed_at TEXT,
+                        idempotency_key TEXT
                     )
                     """
                 )
@@ -119,6 +121,11 @@ class UnifiedGovernanceEngine:
                     connection.execute(
                         "ALTER TABLE cumulative_budget_reservations "
                         "ADD COLUMN committed_at TEXT"
+                    )
+                if "idempotency_key" not in columns:
+                    connection.execute(
+                        "ALTER TABLE cumulative_budget_reservations "
+                        "ADD COLUMN idempotency_key TEXT"
                     )
                 connection.execute(
                     """
@@ -178,10 +185,15 @@ class UnifiedGovernanceEngine:
         role: str,
         user_id: str,
         amount: Decimal,
+        idempotency_key: str | None = None,
     ) -> tuple[bool, Decimal, str | None]:
         budget_limit = self.role_budget_limits.get(role)
         if not user_id or budget_limit is None or not amount.is_finite() or amount <= 0:
             return False, Decimal("0"), None
+        if idempotency_key is None:
+            idempotency_key = uuid.uuid4().hex
+        elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("Idempotency key must be a non-empty string.")
 
         now = time.time()
         window_start = now - self.budget_window_seconds
@@ -221,8 +233,8 @@ class UnifiedGovernanceEngine:
                     """
                     INSERT INTO cumulative_budget_reservations
                         (reservation_id, role, user_id, amount, reserved_at,
-                         status, expires_at)
-                    VALUES (?, ?, ?, ?, ?, 'RESERVED', ?)
+                        status, expires_at, idempotency_key)
+                    VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?)
                     """,
                     (
                         reservation_id,
@@ -231,6 +243,7 @@ class UnifiedGovernanceEngine:
                         str(amount),
                         now,
                         now + self.reservation_ttl_seconds,
+                        idempotency_key,
                     ),
                 )
                 connection.commit()
@@ -343,7 +356,13 @@ class UnifiedGovernanceEngine:
         operator_id: str,
         operator_context: Any,
     ) -> bool:
-        operator = self._verify_operator_context(operator_context)
+        operator = self.verify_operator_context(operator_context)
+        if not isinstance(operator_id, str) or operator_id != operator[
+            "identity"
+        ]["user_id"]:
+            raise SecurityViolationError(
+                "Operator ID must match the verified operator identity."
+            )
         if not isinstance(resolution, str) or resolution not in (
             "RELEASED",
             "COMMITTED",
@@ -404,22 +423,10 @@ class UnifiedGovernanceEngine:
             signature_valid = hmac.compare_digest(
                 provider_signature, expected_signature
             )
-        payload_hash = proof.get("proof_payload_hash")
-        hash_valid = (
-            isinstance(payload_hash, str)
-            and len(payload_hash) == hashlib.sha256().digest_size * 2
-            and payload_hash.isascii()
-            and hmac.compare_digest(
-                payload_hash,
-                hashlib.sha256(canonical_proof_payload).hexdigest(),
-            )
-        )
-        if not (signature_valid or hash_valid):
+        if not signature_valid:
             raise ReconciliationProofRequiredError(
-                "Provider proof signature or payload hash is invalid."
+                "Provider proof HMAC signature is invalid."
             )
-        if not isinstance(operator_id, str) or not operator_id.strip():
-            raise ValueError("Operator ID must be non-empty.")
         if not reservation_id:
             raise ValueError("Reservation ID must be non-empty.")
         try:
@@ -443,7 +450,7 @@ class UnifiedGovernanceEngine:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
-                    SELECT status
+                    SELECT status, idempotency_key
                     FROM cumulative_budget_reservations
                     WHERE reservation_id = ?
                     """,
@@ -456,6 +463,17 @@ class UnifiedGovernanceEngine:
                     connection.rollback()
                     raise BudgetStateConflictError(
                         f"Budget reservation {reservation_id!r} is not unresolved."
+                    )
+                if (
+                    not isinstance(row[1], str)
+                    or not row[1]
+                    or not hmac.compare_digest(
+                        proof["idempotency_key"], row[1]
+                    )
+                ):
+                    connection.rollback()
+                    raise ReconciliationProofRequiredError(
+                        "Provider proof idempotency key does not match the reservation."
                     )
                 previous_status = row[0]
                 committed_at = (
@@ -489,7 +507,7 @@ class UnifiedGovernanceEngine:
                         previous_status,
                         resolution,
                         proof_json,
-                        operator_id.strip() or str(operator.get("user_id", "")),
+                        operator["identity"]["user_id"],
                         time.time(),
                     ),
                 )
@@ -499,7 +517,7 @@ class UnifiedGovernanceEngine:
             raise RuntimeError("Could not persist budget reconciliation.") from exc
 
     @staticmethod
-    def _verify_operator_context(operator_context: Any) -> dict[str, Any]:
+    def verify_operator_context(operator_context: Any) -> dict[str, Any]:
         if not isinstance(operator_context, dict):
             raise SecurityViolationError("A signed operator context is required.")
         signature = operator_context.get("__signature__")
@@ -544,10 +562,19 @@ class UnifiedGovernanceEngine:
             raise SecurityViolationError(
                 "Operator role is not authorized to reconcile reservations."
             )
-        if not isinstance(unsigned_context.get("user_id"), str) or not unsigned_context[
-            "user_id"
-        ]:
+        identity = unsigned_context.get("identity")
+        if not isinstance(identity, dict) or not isinstance(
+            identity.get("user_id"), str
+        ) or not identity["user_id"].strip():
             raise SecurityViolationError("Signed operator identity is incomplete.")
+        expires_at = unsigned_context.get("expires_at")
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+            or expires_at <= time.time()
+        ):
+            raise SecurityViolationError("Operator context has expired or is invalid.")
         return unsigned_context
 
     def _transition_budget_status(

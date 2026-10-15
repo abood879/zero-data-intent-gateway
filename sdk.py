@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
@@ -408,19 +409,11 @@ def reconcile_budget_reservation(
     operator_id: str,
     operator_context: Any,
 ) -> bool:
-    try:
-        operator = verify_trusted_identity(operator_context)
-    except IdentitySpoofingError as exc:
+    operator = governance_engine.verify_operator_context(operator_context)
+    operator_identity = operator["identity"]["user_id"]
+    if not isinstance(operator_id, str) or operator_id != operator_identity:
         raise SecurityViolationError(
-            "A verified privileged operator context is required."
-        ) from exc
-    if operator.get("role") not in {
-        "reconciler",
-        "admin",
-        "governance_admin",
-    }:
-        raise SecurityViolationError(
-            "Operator role is not authorized to reconcile reservations."
+            "Operator ID must match the verified operator identity."
         )
     return governance_engine.reconcile_reservation(
         reservation_id,
@@ -504,10 +497,16 @@ def _evaluate_and_authorize(
             not metadata.get("step_up_required") or step_up_approved
         ):
             amount = Decimal(str(parameters["amount"]))
+            idempotency_key = parameters.get("idempotency_key")
+            if idempotency_key is None:
+                idempotency_key = uuid.uuid4().hex
+            elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ValueError("Idempotency key must be a non-empty string.")
             reserved, cumulative_total, reservation_id = governance_engine.reserve_budget(
                 str(identity["role"]),
                 str(identity["user_id"]),
                 amount,
+                idempotency_key,
             )
             if not reserved:
                 reasons.append(
