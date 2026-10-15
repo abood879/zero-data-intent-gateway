@@ -22,7 +22,12 @@ from app.engine import (
     IdempotencyConflictError,
     ReconciliationProofRequiredError,
     SecurityViolationError,
+    UnsupportedCurrencyError,
     governance_engine,
+)
+
+_IDEMPOTENT_TOOL_NAMES = frozenset(
+    {"wire_transfer", "admin_execute", "database_drop"}
 )
 
 
@@ -352,6 +357,9 @@ class AuditLedger:
         decision: str,
         execution_latency: float | None = None,
         exception_summary: dict[str, str] | None = None,
+        reservation_id: str | None = None,
+        resolved_idempotency_key: str | None = None,
+        currency: str | None = None,
     ) -> str:
         try:
             params_digest = _parameters_digest(params)
@@ -380,6 +388,9 @@ class AuditLedger:
                             "params_digest": params_digest,
                             "execution_latency": execution_latency,
                             "exception_summary": exception_summary,
+                            "reservation_id": reservation_id,
+                            "resolved_idempotency_key": resolved_idempotency_key,
+                            "currency": currency,
                         }
                         block_hash = hashlib.sha256(
                             _canonical_json(payload)
@@ -436,6 +447,8 @@ def _commit_budget_after_execution(
     identity: dict[str, Any],
     dof: int,
     execution_token: str | None,
+    resolved_idempotency_key: str | None,
+    currency: str | None,
 ) -> None:
     try:
         governance_engine.commit_budget(reservation_id, execution_token)
@@ -453,6 +466,9 @@ def _commit_budget_after_execution(
                     "type": type(exc).__name__,
                     "message": str(exc)[:500],
                 },
+                reservation_id=reservation_id,
+                resolved_idempotency_key=resolved_idempotency_key,
+                currency=currency,
             )
         except Exception as audit_exc:
             raise CriticalAuditFailureError(
@@ -471,7 +487,7 @@ def _evaluate_and_authorize(
     identity: dict[str, Any],
     max_allowed_dof: int,
     step_up_approval_token: Any,
-) -> tuple[int, list[str], str | None, str | None, str | None]:
+) -> tuple[int, list[str], str | None, str | None, str | None, str | None]:
     dof, reasons, metadata = governance_engine.evaluate(
         {
             "tool": tool,
@@ -500,17 +516,24 @@ def _evaluate_and_authorize(
     reservation_id = None
     execution_token = None
     resolved_idempotency_key = None
+    resolved_currency = None
     try:
-        if tool == "wire_transfer" and dof < 2 and (
-            not metadata.get("step_up_required") or step_up_approved
-        ):
-            amount = Decimal(str(parameters["amount"]))
+        if tool in _IDEMPOTENT_TOOL_NAMES:
             idempotency_key = parameters.get("idempotency_key")
             if idempotency_key is None:
                 idempotency_key = uuid.uuid4().hex
             elif not isinstance(idempotency_key, str) or not idempotency_key.strip():
                 raise ValueError("Idempotency key must be a non-empty string.")
+            resolved_idempotency_key = idempotency_key
+
+        if tool == "wire_transfer" and dof < 2 and (
+            not metadata.get("step_up_required") or step_up_approved
+        ):
+            amount = Decimal(str(parameters["amount"]))
             currency = parameters.get("currency", "USD")
+            if not isinstance(currency, str) or not currency.strip():
+                raise UnsupportedCurrencyError("A supported currency is required.")
+            currency = currency.strip().upper()
             (
                 reserved,
                 cumulative_total,
@@ -520,10 +543,10 @@ def _evaluate_and_authorize(
                 str(identity["role"]),
                 str(identity["user_id"]),
                 amount,
-                idempotency_key,
+                resolved_idempotency_key,
                 currency,
             )
-            resolved_idempotency_key = idempotency_key
+            resolved_currency = currency
             if not reserved:
                 reasons.append(
                     "Cumulative financial budget exceeded for this identity and time window."
@@ -540,6 +563,9 @@ def _evaluate_and_authorize(
             "POLICY_EVALUATED",
             dof=dof,
             decision=decision,
+            reservation_id=reservation_id,
+            resolved_idempotency_key=resolved_idempotency_key,
+            currency=resolved_currency,
         )
 
         if dof >= 2:
@@ -566,6 +592,7 @@ def _evaluate_and_authorize(
             reservation_id,
             execution_token,
             resolved_idempotency_key,
+            resolved_currency,
         )
     except BaseException:
         if reservation_id:
@@ -583,6 +610,8 @@ def _run_with_audit(
     dof: int,
     reservation_id: str | None,
     execution_token: str | None,
+    resolved_idempotency_key: str | None,
+    currency: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -629,6 +658,9 @@ def _run_with_audit(
                     if execution_error is not None
                     else None
                 ),
+                reservation_id=reservation_id,
+                resolved_idempotency_key=resolved_idempotency_key,
+                currency=currency,
             )
         except Exception as exc:
             if reservation_id and not failed:
@@ -638,7 +670,14 @@ def _run_with_audit(
             ) from exc
         if reservation_id and not failed:
             _commit_budget_after_execution(
-                reservation_id, tool, parameters, identity, dof, execution_token
+                reservation_id,
+                tool,
+                parameters,
+                identity,
+                dof,
+                execution_token,
+                resolved_idempotency_key,
+                currency,
             )
     return result
 
@@ -653,6 +692,8 @@ async def _run_async_with_audit(
     dof: int,
     reservation_id: str | None,
     execution_token: str | None,
+    resolved_idempotency_key: str | None,
+    currency: str | None,
 ) -> Any:
     started_at = time.perf_counter()
     execution_error: BaseException | None = None
@@ -699,6 +740,9 @@ async def _run_async_with_audit(
                     if execution_error is not None
                     else None
                 ),
+                reservation_id=reservation_id,
+                resolved_idempotency_key=resolved_idempotency_key,
+                currency=currency,
             )
         except Exception as exc:
             if reservation_id and not failed:
@@ -708,7 +752,14 @@ async def _run_async_with_audit(
             ) from exc
         if reservation_id and not failed:
             _commit_budget_after_execution(
-                reservation_id, tool, parameters, identity, dof, execution_token
+                reservation_id,
+                tool,
+                parameters,
+                identity,
+                dof,
+                execution_token,
+                resolved_idempotency_key,
+                currency,
             )
     return result
 
@@ -739,6 +790,7 @@ def _inject_idempotency_key(
         return args, kwargs
     idempotency_parameter = signature.parameters.get("idempotency_key")
     if idempotency_parameter is not None and idempotency_parameter.kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
     ):
@@ -763,6 +815,13 @@ def protected_tool(
     def decorator(func: Callable) -> Callable:
         target_tool = tool_name or func.__name__
         signature = inspect.signature(func)
+        if target_tool in _IDEMPOTENT_TOOL_NAMES and "idempotency_key" not in signature.parameters and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            raise SecurityViolationError(
+                "Financial tools must explicitly accept 'idempotency_key' parameter to guarantee external provider propagation"
+            )
 
         def validate_call_identity(raw_context: Any) -> dict[str, Any]:
             if raw_context is None:
@@ -789,6 +848,7 @@ def protected_tool(
                 reservation_id,
                 execution_token,
                 resolved_idempotency_key,
+                currency,
             ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
@@ -812,6 +872,8 @@ def protected_tool(
                 dof,
                 reservation_id,
                 execution_token,
+                resolved_idempotency_key,
+                currency,
             )
 
         @functools.wraps(func)
@@ -827,6 +889,7 @@ def protected_tool(
                 reservation_id,
                 execution_token,
                 resolved_idempotency_key,
+                currency,
             ) = _evaluate_and_authorize(
                 target_tool,
                 bound_args,
@@ -850,6 +913,8 @@ def protected_tool(
                 dof,
                 reservation_id,
                 execution_token,
+                resolved_idempotency_key,
+                currency,
             )
 
         if inspect.iscoroutinefunction(func):

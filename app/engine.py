@@ -28,6 +28,10 @@ class IdempotencyConflictError(RuntimeError):
     """Raised when an idempotency key has already been used for a reservation."""
 
 
+class UnsupportedCurrencyError(SecurityViolationError):
+    """Raised when no cumulative budget policy exists for a requested currency."""
+
+
 class UnifiedGovernanceEngine:
     def __init__(self, budget_db_path: str | Path | None = None):
         self.critical_financial_limit = Decimal(os.getenv("GATEWAY_CRITICAL_LIMIT", "10000.00"))
@@ -58,6 +62,9 @@ class UnifiedGovernanceEngine:
             "admin": Decimal("25000.00"),
             "agent": Decimal("2000.00"),
         }
+        self.role_currency_budget_limits = {
+            role: {"USD": limit} for role, limit in self.role_budget_limits.items()
+        }
         configured_budget_limits = json.loads(
             os.getenv("GATEWAY_ROLE_BUDGET_LIMITS", "{}")
         )
@@ -66,17 +73,27 @@ class UnifiedGovernanceEngine:
         for role, limit in configured_budget_limits.items():
             if not isinstance(role, str) or not role:
                 raise ValueError("Cumulative budget role names must be non-empty strings.")
-            try:
-                parsed_limit = Decimal(str(limit))
-            except InvalidOperation as exc:
-                raise ValueError(
-                    f"Cumulative budget limit for {role!r} must be a decimal."
-                ) from exc
-            if not parsed_limit.is_finite() or parsed_limit <= 0:
-                raise ValueError(
-                    f"Cumulative budget limit for {role!r} must be positive."
-                )
-            self.role_budget_limits[role] = parsed_limit
+            limits_by_currency = limit if isinstance(limit, dict) else {"USD": limit}
+            parsed_limits = {}
+            for currency, currency_limit in limits_by_currency.items():
+                if not isinstance(currency, str) or not currency.strip():
+                    raise ValueError("Budget currency codes must be non-empty strings.")
+                try:
+                    parsed_limit = Decimal(str(currency_limit))
+                except InvalidOperation as exc:
+                    raise ValueError(
+                        f"Cumulative budget limit for {role!r}/{currency} must be a decimal."
+                    ) from exc
+                if not parsed_limit.is_finite() or parsed_limit <= 0:
+                    raise ValueError(
+                        f"Cumulative budget limit for {role!r}/{currency} must be positive."
+                    )
+                parsed_limits[currency.strip().upper()] = parsed_limit
+            if not parsed_limits:
+                raise ValueError(f"Cumulative budget limits for {role!r} cannot be empty.")
+            self.role_currency_budget_limits[role] = parsed_limits
+            if "USD" in parsed_limits:
+                self.role_budget_limits[role] = parsed_limits["USD"]
 
         self.budget_db_path = Path(
             budget_db_path
@@ -145,6 +162,29 @@ class UnifiedGovernanceEngine:
                     )
                 connection.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS idempotency_registry (
+                        idempotency_key TEXT PRIMARY KEY,
+                        reservation_id TEXT,
+                        created_at TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        amount TEXT NOT NULL,
+                        currency TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO idempotency_registry
+                        (idempotency_key, reservation_id, created_at, role, amount, currency)
+                    SELECT idempotency_key, reservation_id,
+                           strftime('%Y-%m-%dT%H:%M:%fZ', reserved_at, 'unixepoch'),
+                           role, amount, currency
+                    FROM cumulative_budget_reservations
+                    WHERE idempotency_key IS NOT NULL
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_idempotency_key
                     ON cumulative_budget_reservations (idempotency_key)
                     WHERE idempotency_key IS NOT NULL
@@ -211,8 +251,7 @@ class UnifiedGovernanceEngine:
         idempotency_key: str | None = None,
         currency: str = "USD",
     ) -> tuple[bool, Decimal, str | None, str | None]:
-        budget_limit = self.role_budget_limits.get(role)
-        if not user_id or budget_limit is None or not amount.is_finite() or amount <= 0:
+        if not user_id or not amount.is_finite() or amount <= 0:
             return False, Decimal("0"), None, None
         if idempotency_key is None:
             idempotency_key = uuid.uuid4().hex
@@ -221,6 +260,11 @@ class UnifiedGovernanceEngine:
         if not isinstance(currency, str) or not currency.strip():
             raise ValueError("Currency must be a non-empty string.")
         currency = currency.strip().upper()
+        budget_limit = self.role_currency_budget_limits.get(role, {}).get(currency)
+        if budget_limit is None:
+            raise UnsupportedCurrencyError(
+                f"No cumulative budget policy is configured for role {role!r} in {currency}."
+            )
 
         now = time.time()
         window_start = now - self.budget_window_seconds
@@ -242,12 +286,13 @@ class UnifiedGovernanceEngine:
                     """
                     SELECT amount
                     FROM cumulative_budget_reservations
-                                        WHERE role = ? AND user_id = ? AND status != 'RELEASED'
+                                        WHERE role = ? AND user_id = ? AND currency = ?
+                                            AND status != 'RELEASED'
                                             AND (status != 'COMMITTED' OR
                                                      (committed_at IS NOT NULL AND committed_at >= ?) OR
                                                      (committed_at IS NULL AND reserved_at >= ?))
                     """,
-                                        (role, user_id, window_start_utc, window_start),
+                                        (role, user_id, currency, window_start_utc, window_start),
                 ).fetchall()
                 current_total = sum(
                     (Decimal(row[0]) for row in reservations),
@@ -257,6 +302,21 @@ class UnifiedGovernanceEngine:
                 if next_total > budget_limit:
                     connection.commit()
                     return False, current_total, None, None
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_registry
+                        (idempotency_key, reservation_id, created_at, role, amount, currency)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        idempotency_key,
+                        reservation_id,
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        role,
+                        str(amount),
+                        currency,
+                    ),
+                )
                 connection.execute(
                     """
                     INSERT INTO cumulative_budget_reservations
@@ -280,11 +340,9 @@ class UnifiedGovernanceEngine:
                 connection.commit()
                 return True, next_total, reservation_id, execution_token
         except sqlite3.IntegrityError as exc:
-            if "idempotency_key" in str(exc):
-                raise IdempotencyConflictError(
-                    f"Idempotency key {idempotency_key!r} is already reserved."
-                ) from exc
-            raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
+            raise IdempotencyConflictError(
+                f"Idempotency key {idempotency_key!r} is already registered."
+            ) from exc
         except (sqlite3.Error, InvalidOperation) as exc:
             raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
 
@@ -295,6 +353,8 @@ class UnifiedGovernanceEngine:
     ) -> bool:
         if not reservation_id:
             raise BudgetStateConflictError("Budget reservation ID is required.")
+        if not isinstance(execution_token, str) or not execution_token.strip():
+            raise BudgetStateConflictError("A valid execution token is required to commit.")
         now = time.time()
         committed_at = datetime.now(timezone.utc).isoformat().replace(
             "+00:00", "Z"
@@ -319,10 +379,10 @@ class UnifiedGovernanceEngine:
                 cursor = connection.execute(
                     """
                     UPDATE cumulative_budget_reservations
-                                        SET status = 'COMMITTED', committed_at = ?
+                                        SET status = 'COMMITTED', committed_at = ?, execution_token = NULL
                     WHERE reservation_id = ?
-                                            AND (status = 'RESERVED' OR
-                                                     (status = 'EXPIRED_UNRESOLVED' AND execution_token = ?))
+                                            AND execution_token = ?
+                                            AND status IN ('RESERVED', 'EXPIRED_UNRESOLVED')
                     """,
                                         (committed_at, reservation_id, execution_token),
                 )

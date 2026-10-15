@@ -18,6 +18,7 @@ from app import main as gateway_main
 from app.engine import (
     BudgetStateConflictError,
     IdempotencyConflictError,
+    UnsupportedCurrencyError,
     governance_engine,
 )
 from app.main import app
@@ -56,7 +57,7 @@ def _execute_transfer_in_process(amount: str) -> bool:
     from sdk import SecurityViolationError, protected_tool
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     context = gateway_main._issue_trusted_context(
@@ -157,7 +158,7 @@ def configure_security_environment(monkeypatch):
 
 def test_unverified_context_injection_fails_closed():
     @protected_tool(tool_name="admin_execute")
-    def execute_maintenance():
+    def execute_maintenance(idempotency_key: str):
         return "RUNNING"
 
     with pytest.raises(IdentitySpoofingError):
@@ -187,7 +188,7 @@ def test_e2e_unified_engine_parity_between_sdk_and_api():
     assert response.json()["dof"] >= 2
 
     @protected_tool(tool_name="wire_transfer")
-    def perform_transfer(amount: str):
+    def perform_transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError):
@@ -201,7 +202,7 @@ def test_tamper_evident_audit_ledger_records_sdk_denials():
     initial_hash = audit_ledger.last_hash
 
     @protected_tool(tool_name="database_drop")
-    def drop_table(target: str):
+    def drop_table(target: str, idempotency_key: str):
         return "DROPPED"
 
     with pytest.raises(SecurityViolationError):
@@ -215,7 +216,7 @@ def test_tamper_evident_audit_ledger_records_sdk_denials():
 @pytest.mark.asyncio
 async def test_async_protected_tool_execution():
     @protected_tool(tool_name="database_drop")
-    async def async_drop():
+    async def async_drop(idempotency_key: str):
         await asyncio.sleep(0.01)
         return "DONE"
 
@@ -240,7 +241,7 @@ def test_unknown_tool_fails_closed_immediately():
 
 def test_untrusted_context_spoofing_blocked_via_hmac():
     @protected_tool(tool_name="admin_execute")
-    def execute_maintenance():
+    def execute_maintenance(idempotency_key: str):
         return "RUNNING"
 
     with pytest.raises(IdentitySpoofingError):
@@ -262,7 +263,7 @@ def test_untrusted_context_spoofing_blocked_via_hmac():
 
 def test_valid_hmac_signed_context_authorized():
     @protected_tool(tool_name="admin_execute")
-    def execute_maintenance():
+    def execute_maintenance(idempotency_key: str):
         return "RUNNING"
 
     context = gateway_main._issue_trusted_context(
@@ -433,7 +434,7 @@ def test_max_allowed_dof_does_not_bypass_financial_step_up():
     )
 
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=1)
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(DisambiguationRequiredError):
@@ -573,7 +574,7 @@ def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
     monkeypatch.setattr(sdk.step_up_nonce_store, "consume", unavailable_store)
 
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=1)
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         pytest.fail("Execution must not proceed if nonce consumption fails.")
 
     with pytest.raises(AuditLedgerError, match="nonce store unavailable"):
@@ -586,7 +587,7 @@ def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
 
 def test_max_allowed_dof_cannot_bypass_security_invariants():
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=99)
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError):
@@ -636,7 +637,7 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def failing_transfer(amount: str):
+    def failing_transfer(amount: str, idempotency_key: str):
         raise ConfirmedToolFailureError("transfer failed before mutation")
 
     with pytest.raises(ConfirmedToolFailureError, match="before mutation"):
@@ -645,7 +646,7 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
     assert budget_reservation_statuses(budget_path, user_id) == ["RELEASED"]
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str):
+    def valid_transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     assert valid_transfer(amount="4000.00", __context__=context) == "TRANSFERRED"
@@ -669,7 +670,7 @@ def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def timed_out_transfer(amount: str):
+    def timed_out_transfer(amount: str, idempotency_key: str):
         raise TimeoutError("connection lost after external debit")
 
     with pytest.raises(TimeoutError, match="after external debit"):
@@ -682,7 +683,7 @@ def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
     assert ledger.chain[-1]["decision"] == "OUTCOME_UNKNOWN"
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str):
+    def valid_transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
@@ -705,7 +706,7 @@ def test_success_after_reservation_expiry_commits_without_orphaning(
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer_after_expiry(amount: str):
+    def transfer_after_expiry(amount: str, idempotency_key: str):
         with sqlite3.connect(budget_path) as connection:
             connection.execute(
                 "UPDATE cumulative_budget_reservations SET expires_at = 0 "
@@ -722,7 +723,7 @@ def test_success_after_reservation_expiry_commits_without_orphaning(
     assert ledger.chain[-1]["status"] == "EXECUTION_SUCCESS"
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str):
+    def valid_transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
@@ -738,7 +739,7 @@ def test_successful_transfer_commits_budget_reservation(tmp_path, monkeypatch):
     user_id = "reservation-commit-user"
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     assert (
@@ -774,11 +775,17 @@ async def test_protected_tool_forwards_resolved_idempotency_key(
         sdk, "audit_ledger", AuditLedger(tmp_path / "forward-key-audit.jsonl")
     )
     explicit_keys = []
+    positional_only_keys = []
     variadic_keys = []
 
     @protected_tool(tool_name="wire_transfer")
     def explicit_transfer(amount: str, idempotency_key: str):
         explicit_keys.append(idempotency_key)
+        return "TRANSFERRED"
+
+    @protected_tool(tool_name="wire_transfer")
+    def positional_only_transfer(amount: str, idempotency_key: str, /):
+        positional_only_keys.append(idempotency_key)
         return "TRANSFERRED"
 
     @protected_tool(tool_name="wire_transfer")
@@ -789,12 +796,151 @@ async def test_protected_tool_forwards_resolved_idempotency_key(
     assert explicit_transfer(
         amount="10.00", __context__=trusted_context("finance_agent", "explicit-key-user")
     ) == "TRANSFERRED"
+    assert positional_only_transfer(
+        "10.00",
+        __context__=trusted_context("finance_agent", "positional-key-user"),
+    ) == "TRANSFERRED"
     assert await variadic_transfer(
         amount="10.00", __context__=trusted_context("finance_agent", "kwargs-key-user")
     ) == "TRANSFERRED"
     assert len(explicit_keys) == 1 and explicit_keys[0]
+    assert len(positional_only_keys) == 1 and positional_only_keys[0]
     assert len(variadic_keys) == 1 and variadic_keys[0]
-    assert explicit_keys[0] != variadic_keys[0]
+    assert len({explicit_keys[0], positional_only_keys[0], variadic_keys[0]}) == 3
+
+
+def test_financial_tool_requires_idempotency_key_parameter():
+    with pytest.raises(
+        SecurityViolationError,
+        match="must explicitly accept 'idempotency_key'",
+    ):
+        @protected_tool(tool_name="wire_transfer")
+        def unprotected_transfer(amount: str):
+            return "TRANSFERRED"
+
+
+def test_currency_budgets_are_isolated_and_unsupported_currency_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "GATEWAY_ROLE_BUDGET_LIMITS",
+        '{"finance_agent": {"USD": "5000.00", "JPY": "10000"}}',
+    )
+    engine = type(governance_engine)(budget_db_path=tmp_path / "currency-budgets.sqlite3")
+    accepted, jpy_total, _, _ = engine.reserve_budget(
+        "finance_agent", "currency-user", Decimal("5000"), "jpy-key", "JPY"
+    )
+    assert accepted and jpy_total == Decimal("5000")
+    accepted, usd_total, _, _ = engine.reserve_budget(
+        "finance_agent", "currency-user", Decimal("5000.00"), "usd-key", "USD"
+    )
+    assert accepted and usd_total == Decimal("5000.00")
+
+    accepted, _, _, _ = engine.reserve_budget(
+        "finance_agent", "currency-user", Decimal("5001"), "jpy-over-key", "JPY"
+    )
+    assert not accepted
+    with pytest.raises(UnsupportedCurrencyError):
+        engine.reserve_budget(
+            "finance_agent", "currency-user", Decimal("1"), "eur-key", "EUR"
+        )
+
+
+def test_commits_always_require_matching_execution_token(tmp_path):
+    budget_path = tmp_path / "commit-token.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    accepted, _, reservation_id, execution_token = engine.reserve_budget(
+        "finance_agent", "commit-token-user", Decimal("100.00"), "commit-token-key"
+    )
+    assert accepted and reservation_id and execution_token
+
+    with pytest.raises(BudgetStateConflictError):
+        engine.commit_budget(reservation_id)
+    with pytest.raises(BudgetStateConflictError):
+        engine.commit_budget(reservation_id, "incorrect-token")
+    assert budget_reservation_statuses(budget_path, "commit-token-user") == [
+        "RESERVED"
+    ]
+
+    assert engine.commit_budget(reservation_id, execution_token)
+    with sqlite3.connect(budget_path) as connection:
+        stored_token = connection.execute(
+            "SELECT execution_token FROM cumulative_budget_reservations "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()[0]
+    assert stored_token is None
+    with pytest.raises(BudgetStateConflictError):
+        engine.commit_budget(reservation_id, execution_token)
+
+
+def test_idempotency_registry_tombstone_survives_budget_cleanup(tmp_path):
+    budget_path = tmp_path / "idempotency-tombstones.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    accepted, _, reservation_id, _ = engine.reserve_budget(
+        "finance_agent", "tombstone-user", Decimal("10.00"), "permanent-key"
+    )
+    assert accepted and reservation_id
+    assert engine.release_budget(reservation_id)
+    with sqlite3.connect(budget_path) as connection:
+        connection.execute(
+            "UPDATE cumulative_budget_reservations SET reserved_at = 0 "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+    accepted, _, _, _ = engine.reserve_budget(
+        "finance_agent", "tombstone-user", Decimal("10.00"), "cleanup-trigger-key"
+    )
+    assert accepted
+    with sqlite3.connect(budget_path) as connection:
+        reservation = connection.execute(
+            "SELECT 1 FROM cumulative_budget_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        registry = connection.execute(
+            "SELECT idempotency_key FROM idempotency_registry "
+            "WHERE idempotency_key = ?",
+            ("permanent-key",),
+        ).fetchone()
+    assert reservation is None
+    assert registry == ("permanent-key",)
+
+    with pytest.raises(IdempotencyConflictError):
+        engine.reserve_budget(
+            "finance_agent", "tombstone-user", Decimal("10.00"), "permanent-key"
+        )
+
+
+def test_audit_events_include_budget_correlation_fields(tmp_path, monkeypatch):
+    budget_path = tmp_path / "audit-correlation.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    ledger = AuditLedger(tmp_path / "audit-correlation.jsonl")
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(sdk, "audit_ledger", ledger)
+    user_id = "audit-correlation-user"
+    idempotency_key = "audit-correlation-key"
+
+    @protected_tool(tool_name="wire_transfer")
+    def transfer(amount: str, idempotency_key: str, currency: str):
+        return "TRANSFERRED"
+
+    assert transfer(
+        amount="25.00",
+        idempotency_key=idempotency_key,
+        currency="USD",
+        __context__=trusted_context("finance_agent", user_id),
+    ) == "TRANSFERRED"
+    events = ledger.chain[-2:]
+    assert [event["status"] for event in events] == [
+        "POLICY_EVALUATED",
+        "EXECUTION_SUCCESS",
+    ]
+    assert len({event["reservation_id"] for event in events}) == 1
+    assert all(
+        event["resolved_idempotency_key"] == idempotency_key
+        and event["currency"] == "USD"
+        for event in events
+    )
 
 
 def test_expired_reservation_locks_budget_until_resolved(tmp_path, monkeypatch):
@@ -1344,11 +1490,11 @@ def test_committed_window_rolls_but_unresolved_holds_do_not(
     engine = type(governance_engine)(budget_db_path=budget_path)
 
     committed_user = "old-committed-user"
-    accepted, _, committed_id, _ = engine.reserve_budget(
+    accepted, _, committed_id, committed_execution_token = engine.reserve_budget(
         "finance_agent", committed_user, Decimal("10000.00")
     )
     assert accepted and committed_id
-    assert engine.commit_budget(committed_id)
+    assert engine.commit_budget(committed_id, committed_execution_token)
     with sqlite3.connect(budget_path) as connection:
         connection.execute(
             """
@@ -1397,7 +1543,7 @@ def test_settlement_time_controls_committed_budget_window(tmp_path, monkeypatch)
     )
     engine = type(governance_engine)(budget_db_path=budget_path)
     user_id = "settlement-window-user"
-    accepted, _, reservation_id, _ = engine.reserve_budget(
+    accepted, _, reservation_id, execution_token = engine.reserve_budget(
         "finance_agent", user_id, Decimal("10000.00")
     )
     assert accepted and reservation_id
@@ -1409,7 +1555,7 @@ def test_settlement_time_controls_committed_budget_window(tmp_path, monkeypatch)
             (time.time() - 7200, reservation_id),
         )
 
-    assert engine.commit_budget(reservation_id)
+    assert engine.commit_budget(reservation_id, execution_token)
     with sqlite3.connect(budget_path) as connection:
         committed_at = connection.execute(
             "SELECT committed_at FROM cumulative_budget_reservations "
@@ -1465,7 +1611,7 @@ def test_successful_execution_with_failed_audit_requires_reconciliation(
     executed = []
 
     @protected_tool(tool_name="admin_execute")
-    def side_effecting_operation():
+    def side_effecting_operation(idempotency_key: str):
         executed.append(True)
         return "COMPLETED"
 
@@ -1505,7 +1651,7 @@ def test_successful_transfer_with_audit_failure_locks_cumulative_budget(
     monkeypatch.setattr(ledger, "record", fail_success_record)
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str):
+    def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
@@ -1548,7 +1694,7 @@ async def test_async_success_with_audit_failure_flags_reconciliation(
     monkeypatch.setattr(ledger, "record", fail_success_record)
 
     @protected_tool(tool_name="wire_transfer")
-    async def transfer(amount: str):
+    async def transfer(amount: str, idempotency_key: str):
         return "TRANSFERRED"
 
     with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
@@ -1575,7 +1721,7 @@ def test_tool_execution_failure_is_written_to_persistent_ledger(
     )
 
     @protected_tool(tool_name="admin_execute")
-    def broken_operation():
+    def broken_operation(idempotency_key: str):
         raise ValueError("execution failed for test")
 
     with pytest.raises(ValueError, match="execution failed for test"):
