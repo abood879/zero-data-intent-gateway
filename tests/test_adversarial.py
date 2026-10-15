@@ -291,7 +291,7 @@ def test_server_enforced_financial_limits_override_client_injection():
     assert response.status_code == 200
     assert response.json()["dof"] == 1
     assert any(
-        "server-enforced limit (5000.00)" in item
+        "server-enforced limit (5000 USD)" in item
         for item in response.json()["violations"]
     )
 
@@ -941,6 +941,78 @@ def test_audit_events_include_budget_correlation_fields(tmp_path, monkeypatch):
         and event["currency"] == "USD"
         for event in events
     )
+
+
+def test_currency_specific_single_transaction_limits_fail_closed_or_step_up():
+    dof, violations, metadata = governance_engine.evaluate(
+        {
+            "tool": "wire_transfer",
+            "parameters": {"amount": "4900", "currency": "EUR"},
+            "context": {"role": "finance_agent", "user_id": "eur-limit-user"},
+        }
+    )
+    assert dof == 1
+    assert metadata["step_up_required"] is True
+    assert any("4500 EUR" in violation for violation in violations)
+
+    dof, violations, _ = governance_engine.evaluate(
+        {
+            "tool": "wire_transfer",
+            "parameters": {"amount": "1", "currency": "JPY"},
+            "context": {"role": "finance_agent", "user_id": "unmapped-currency-user"},
+        }
+    )
+    assert dof >= 2
+    assert any("No single-transaction limit" in violation for violation in violations)
+
+
+def test_nonfinancial_mutation_keys_are_permanently_registered(tmp_path, monkeypatch):
+    budget_path = tmp_path / "mutation-idempotency.sqlite3"
+    engine = type(governance_engine)(budget_db_path=budget_path)
+    monkeypatch.setattr(sdk, "governance_engine", engine)
+    monkeypatch.setattr(
+        sdk, "audit_ledger", AuditLedger(tmp_path / "mutation-idempotency.jsonl")
+    )
+
+    @protected_tool(tool_name="admin_execute")
+    def admin_operation(operation: str, idempotency_key: str):
+        return operation
+
+    context = trusted_context("admin", "mutation-admin")
+    assert admin_operation(
+        operation="rotate", idempotency_key="mutation-once", __context__=context
+    ) == "rotate"
+    with pytest.raises(IdempotencyConflictError):
+        admin_operation(
+            operation="rotate", idempotency_key="mutation-once", __context__=context
+        )
+    with sqlite3.connect(budget_path) as connection:
+        entry = connection.execute(
+            "SELECT tool_name, context_user_id FROM idempotency_registry "
+            "WHERE idempotency_key = ?",
+            ("mutation-once",),
+        ).fetchone()
+    assert entry == ("admin_execute", "mutation-admin")
+
+
+def test_secure_provider_transport_transmits_gateway_idempotency_key():
+    captured = {}
+
+    def dispatch(**request):
+        captured.update(request)
+        return "sent"
+
+    transport = sdk.SecureProviderTransport(dispatch)
+    assert transport.dispatch(
+        idempotency_key="gateway-request-123",
+        url="https://provider.example/transfer",
+        headers={"Content-Type": "application/json"},
+        payload={"amount": "42.00"},
+    ) == "sent"
+    assert captured["headers"]["Idempotency-Key"] == "gateway-request-123"
+    assert captured["payload"]["idempotency_key"] == "gateway-request-123"
+    with pytest.raises(SecurityViolationError, match="requires a gateway idempotency_key"):
+        transport.dispatch(url="https://provider.example/transfer", payload={"amount": "1"})
 
 
 def test_expired_reservation_locks_budget_until_resolved(tmp_path, monkeypatch):

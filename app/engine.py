@@ -12,6 +12,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
+ROLE_CURRENCY_TRANSACTION_LIMITS = {
+    "finance_operator": {
+        "USD": Decimal("5000"),
+        "EUR": Decimal("4500"),
+    },
+    "finance_agent": {
+        "USD": Decimal("10000"),
+        "EUR": Decimal("9000"),
+    },
+    "admin": {
+        "USD": Decimal("25000"),
+        "EUR": Decimal("20000"),
+    },
+}
+CRITICAL_FINANCIAL_LIMITS = {
+    "USD": Decimal("5000"),
+    "EUR": Decimal("4500"),
+}
+
+
 class BudgetStateConflictError(RuntimeError):
     """Raised when a reservation is no longer eligible for a state transition."""
 
@@ -49,7 +69,7 @@ class UnifiedGovernanceEngine:
         self.tool_permissions = {
             "database_drop": ["superadmin"],
             "admin_execute": ["admin"],
-            "wire_transfer": ["finance_agent", "admin"],
+            "wire_transfer": ["finance_agent", "finance_operator", "admin"],
             "read_records": ["guest", "agent", "support_agent", "finance_agent", "admin"]
         }
         self.role_limits = {
@@ -59,12 +79,16 @@ class UnifiedGovernanceEngine:
         }
         self.role_budget_limits = {
             "finance_agent": Decimal("10000.00"),
+            "finance_operator": Decimal("10000.00"),
             "admin": Decimal("25000.00"),
             "agent": Decimal("2000.00"),
         }
         self.role_currency_budget_limits = {
             role: {"USD": limit} for role, limit in self.role_budget_limits.items()
         }
+        self.role_currency_budget_limits["finance_agent"]["EUR"] = Decimal("9000.00")
+        self.role_currency_budget_limits["finance_operator"]["EUR"] = Decimal("9000.00")
+        self.role_currency_budget_limits["admin"]["EUR"] = Decimal("20000.00")
         configured_budget_limits = json.loads(
             os.getenv("GATEWAY_ROLE_BUDGET_LIMITS", "{}")
         )
@@ -168,17 +192,34 @@ class UnifiedGovernanceEngine:
                         created_at TEXT NOT NULL,
                         role TEXT NOT NULL,
                         amount TEXT NOT NULL,
-                        currency TEXT NOT NULL
+                        currency TEXT NOT NULL,
+                        tool_name TEXT,
+                        context_user_id TEXT
                     )
                     """
                 )
+                registry_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(idempotency_registry)"
+                    )
+                }
+                if "tool_name" not in registry_columns:
+                    connection.execute(
+                        "ALTER TABLE idempotency_registry ADD COLUMN tool_name TEXT"
+                    )
+                if "context_user_id" not in registry_columns:
+                    connection.execute(
+                        "ALTER TABLE idempotency_registry ADD COLUMN context_user_id TEXT"
+                    )
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO idempotency_registry
-                        (idempotency_key, reservation_id, created_at, role, amount, currency)
+                        (idempotency_key, reservation_id, created_at, role, amount,
+                         currency, tool_name, context_user_id)
                     SELECT idempotency_key, reservation_id,
                            strftime('%Y-%m-%dT%H:%M:%fZ', reserved_at, 'unixepoch'),
-                           role, amount, currency
+                           role, amount, currency, 'wire_transfer', user_id
                     FROM cumulative_budget_reservations
                     WHERE idempotency_key IS NOT NULL
                     """
@@ -250,6 +291,7 @@ class UnifiedGovernanceEngine:
         amount: Decimal,
         idempotency_key: str | None = None,
         currency: str = "USD",
+        tool_name: str = "wire_transfer",
     ) -> tuple[bool, Decimal, str | None, str | None]:
         if not user_id or not amount.is_finite() or amount <= 0:
             return False, Decimal("0"), None, None
@@ -305,8 +347,9 @@ class UnifiedGovernanceEngine:
                 connection.execute(
                     """
                     INSERT INTO idempotency_registry
-                        (idempotency_key, reservation_id, created_at, role, amount, currency)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (idempotency_key, reservation_id, created_at, role, amount,
+                         currency, tool_name, context_user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         idempotency_key,
@@ -315,6 +358,8 @@ class UnifiedGovernanceEngine:
                         role,
                         str(amount),
                         currency,
+                        tool_name,
+                        user_id,
                     ),
                 )
                 connection.execute(
@@ -345,6 +390,48 @@ class UnifiedGovernanceEngine:
             ) from exc
         except (sqlite3.Error, InvalidOperation) as exc:
             raise RuntimeError("Could not atomically reserve cumulative budget.") from exc
+
+    def register_mutation_idempotency_key(
+        self,
+        idempotency_key: str,
+        tool_name: str,
+        role: str,
+        context_user_id: str,
+    ) -> None:
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("Idempotency key must be a non-empty string.")
+        if not tool_name or not role or not context_user_id:
+            raise ValueError("Tool name, role, and context user ID are required.")
+        try:
+            with sqlite3.connect(
+                self.budget_db_path,
+                timeout=10,
+                isolation_level=None,
+            ) as connection:
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_registry
+                        (idempotency_key, reservation_id, created_at, role, amount,
+                         currency, tool_name, context_user_id)
+                    VALUES (?, NULL, ?, ?, '0', 'N/A', ?, ?)
+                    """,
+                    (
+                        idempotency_key,
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        role,
+                        tool_name,
+                        context_user_id,
+                    ),
+                )
+                connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise IdempotencyConflictError(
+                f"Idempotency key {idempotency_key!r} is already registered."
+            ) from exc
+        except sqlite3.Error as exc:
+            raise RuntimeError("Could not register mutation idempotency key.") from exc
 
     def commit_budget(
         self,
@@ -798,24 +885,35 @@ class UnifiedGovernanceEngine:
             else:
                 try:
                     amount = Decimal(str(amount_raw))
-                    if amount <= Decimal("0"):
+                    currency_raw = params.get("currency", "USD")
+                    currency = (
+                        currency_raw.strip().upper()
+                        if isinstance(currency_raw, str)
+                        else ""
+                    )
+                    role_limit = ROLE_CURRENCY_TRANSACTION_LIMITS.get(
+                        role, {}
+                    ).get(currency)
+                    critical_limit = CRITICAL_FINANCIAL_LIMITS.get(currency)
+                    if not amount.is_finite() or amount <= Decimal("0"):
                         violations.append("Amount must be strictly positive")
                         dof += 2
-                    elif amount > self.critical_financial_limit:
-                        violations.append(f"Amount {amount} exceeds critical invariant limit ({self.critical_financial_limit})")
+                    elif role_limit is None or critical_limit is None:
+                        violations.append(
+                            f"Security Invariant: No single-transaction limit is configured for role '{role}' in currency '{currency or currency_raw}' (Fail-Closed)."
+                        )
                         dof += 2
-                    else:
-                        role_limit = self.role_limits.get(role)
-                        if role_limit is None:
-                            violations.append(
-                                f"Security Invariant: Role '{role}' has no configured financial limit (Fail-Closed)."
-                            )
-                            dof += 2
-                            return dof, violations, metadata
-                        if amount > role_limit:
-                            violations.append(f"Amount {amount} exceeds server-enforced limit ({role_limit}); step-up authorization required")
-                            dof += 1
-                            metadata["step_up_required"] = True
+                    elif amount > role_limit:
+                        violations.append(
+                            f"Amount {amount} exceeds currency-specific transaction limit ({role_limit} {currency})."
+                        )
+                        dof += 2
+                    elif amount > critical_limit:
+                        violations.append(
+                            f"Amount {amount} exceeds currency-specific server-enforced limit ({critical_limit} {currency}); step-up authorization required"
+                        )
+                        dof += 1
+                        metadata["step_up_required"] = True
                 except (InvalidOperation, TypeError):
                     violations.append("Invalid decimal representation for financial amount")
                     dof += 2

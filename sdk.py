@@ -60,6 +60,40 @@ class CriticalAuditFailureError(AuditLedgerError):
         self.reconciliation_required = True
 
 
+class SecureProviderTransport:
+    """Dispatch provider requests only with a gateway idempotency key."""
+
+    def __init__(self, dispatch: Callable[..., Any]):
+        self._dispatch = dispatch
+
+    def dispatch(
+        self,
+        *,
+        idempotency_key: str | None = None,
+        headers: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
+        **request_options: Any,
+    ) -> Any:
+        outbound_headers = dict(headers or {})
+        outbound_payload = dict(payload or {})
+        resolved_key = (
+            idempotency_key
+            or outbound_headers.get("Idempotency-Key")
+            or outbound_payload.get("idempotency_key")
+        )
+        if not isinstance(resolved_key, str) or not resolved_key.strip():
+            raise SecurityViolationError(
+                "Provider dispatch requires a gateway idempotency_key."
+            )
+        outbound_headers["Idempotency-Key"] = resolved_key
+        outbound_payload["idempotency_key"] = resolved_key
+        return self._dispatch(
+            headers=outbound_headers,
+            payload=outbound_payload,
+            **request_options,
+        )
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -555,6 +589,15 @@ def _evaluate_and_authorize(
                 decision = "DENIED_CUMULATIVE_BUDGET"
             else:
                 metadata["cumulative_budget_total"] = str(cumulative_total)
+        elif tool in _IDEMPOTENT_TOOL_NAMES and dof < 2 and (
+            not metadata.get("step_up_required") or step_up_approved
+        ):
+            governance_engine.register_mutation_idempotency_key(
+                resolved_idempotency_key,
+                tool,
+                str(identity["role"]),
+                str(identity["user_id"]),
+            )
 
         audit_ledger.record(
             tool,
