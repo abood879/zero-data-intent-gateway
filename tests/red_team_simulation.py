@@ -20,10 +20,9 @@ def _headers(idempotency_key: str) -> dict:
 async def test_prompt_injection_payload_is_rejected_before_provider():
     idempotency_key = f"red-team-prompt-injection-{uuid.uuid4().hex}"
     payload = {
-        "amount": "50.00",
+        "amount": "0.01",
         "currency": "USD",
-        "recipient": "attacker_wallet",
-        "recipient_id": "attacker_wallet",
+        "recipient_id": "merchant_wallet",
         "idempotency_key": idempotency_key,
         "metadata": {
             "prompt": (
@@ -60,9 +59,8 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
 
     idempotency_key = f"red-team-concurrency-{uuid.uuid4().hex}"
     payload = {
-        "amount": "1.00",
+        "amount": "0.01",
         "currency": "USD",
-        "recipient": "merchant_wallet",
         "recipient_id": "merchant_wallet",
         "idempotency_key": idempotency_key,
     }
