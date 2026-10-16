@@ -35,6 +35,15 @@ app = FastAPI(
 )
 
 security = HTTPBearer()
+def _reject_duplicate_keys(ordered_pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in ordered_pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key detected: '{key}'")
+        result[key] = value
+    return result
+
+
 def load_token_identity_map() -> dict[str, dict[str, str]]:
     raw_mapping = os.getenv("TOKEN_IDENTITY_MAP")
     if not raw_mapping:
@@ -255,7 +264,7 @@ async def proxy_transfer(
     started_at = time.perf_counter()
     raw_payload = await request.body()
     try:
-        payload = json.loads(raw_payload)
+        payload = json.loads(raw_payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(
             status_code=400,
@@ -297,9 +306,11 @@ async def proxy_transfer(
             detail="Idempotency-Key header must match the request payload.",
         )
 
+    recipient = payload.get("recipient") or payload.get("recipient_id") or payload.get("destination_account")
     policy_parameters = {
         "amount": payload.get("amount"),
         "currency": payload.get("currency", "USD"),
+        "recipient": str(recipient).strip() if recipient else "",
     }
     dof, violations, _ = governance_engine.evaluate(
         {
@@ -388,7 +399,7 @@ async def proxy_transfer(
             async with httpx.AsyncClient(timeout=10.0) as client:
                 provider_response = await client.post(
                     f"{provider_url}/v1/transfers",
-                    content=raw_payload,
+                    content=canonical_payload,
                     headers={
                         "Content-Type": request.headers.get(
                             "content-type", "application/json"
@@ -407,7 +418,16 @@ async def proxy_transfer(
                 detail="Provider outcome is uncertain; transaction requires reconciliation.",
             ) from exc
 
-        if 200 <= provider_response.status_code < 300:
+        is_success = False
+        if provider_response.status_code in (200, 201):
+            try:
+                body = provider_response.json()
+                if isinstance(body, dict) and body.get("status") == "succeeded":
+                    is_success = True
+            except Exception:
+                is_success = False
+
+        if is_success:
             try:
                 await asyncio.to_thread(
                     governance_engine.commit_budget,
