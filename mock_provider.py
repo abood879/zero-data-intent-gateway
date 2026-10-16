@@ -1,4 +1,4 @@
-"""Local Stripe-like provider simulator for gateway integration exercises."""
+﻿"""Local Stripe-like provider simulator for gateway integration exercises."""
 
 import asyncio
 import os
@@ -91,7 +91,12 @@ async def create_transfer(
                     status_code=409,
                     detail="Idempotency key was reused with a different payload.",
                 )
-            confirmation = {**existing["confirmation"], "cached": True}
+            existing["dispatch_count"] += 1
+            confirmation = {
+                **existing["confirmation"],
+                "cached": True,
+                "dispatch_count": existing["dispatch_count"],
+            }
         else:
             confirmation = {
                 "id": f"tr_{uuid.uuid4().hex}",
@@ -102,10 +107,12 @@ async def create_transfer(
                 "idempotency_key": transfer.idempotency_key,
                 "status": "succeeded",
                 "cached": False,
+                "dispatch_count": 1,
             }
             _transfers[transfer.idempotency_key] = {
                 "payload": payload,
                 "confirmation": confirmation,
+                "dispatch_count": 1,
             }
 
     should_drop = (
@@ -126,4 +133,8 @@ async def get_transfer_status(idempotency_key: str) -> dict[str, Any]:
         existing = _transfers.get(idempotency_key)
         if existing is None:
             raise HTTPException(status_code=404, detail="Transfer not found.")
-        return {**existing["confirmation"], "cached": True}
+        return {
+            **existing["confirmation"],
+            "cached": True,
+            "dispatch_count": existing["dispatch_count"],
+        }
