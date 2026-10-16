@@ -49,3 +49,73 @@ jobs:
           file: ./Dockerfile
           push: false
           tags: zero-data-intent-gateway:ci-latest
+
+  red-team-simulation:
+    name: Run Live Red-Team Gateway Checks
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      GATEWAY_URL: http://127.0.0.1:8000
+      MOCK_PROVIDER_URL: http://127.0.0.1:8090
+      GATEWAY_API_TOKEN: test-token
+      REDIS_URL: redis://127.0.0.1:6379/0
+      TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+      GATEWAY_BUDGET_DB_PATH: ${{ runner.temp }}/red-team-budgets.sqlite3
+      AUDIT_LEDGER_PATH: ${{ runner.temp }}/red-team-audit.jsonl
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start Gateway and Mock Provider
+        run: |
+          python -m uvicorn mock_provider:app --host 0.0.0.0 --port 8090 \
+            >"${RUNNER_TEMP}/mock-provider.log" 2>&1 &
+          provider_pid=$!
+          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 \
+            >"${RUNNER_TEMP}/gateway.log" 2>&1 &
+          gateway_pid=$!
+          cleanup() {
+            kill "$gateway_pid" "$provider_pid" 2>/dev/null || true
+            wait "$gateway_pid" "$provider_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8090/health >/dev/null \
+              && curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if ! curl --fail --silent http://127.0.0.1:8090/health >/dev/null; then
+            cat "${RUNNER_TEMP}/mock-provider.log"
+            exit 1
+          fi
+          if ! curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
+            cat "${RUNNER_TEMP}/gateway.log"
+            exit 1
+          fi
+
+          python -m pytest -v -s tests/red_team_simulation.py
