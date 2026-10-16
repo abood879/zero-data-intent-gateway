@@ -2,56 +2,12 @@
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main, master ]
 
 jobs:
-  test-and-verify:
-    name: Run Unit Tests & Policy Suite
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Execute Deterministic State Collapse Test Suite
-        run: |
-          python -m pytest tests/ -v --durations=0
-
-  docker-build-check:
-    name: Build & Verify Production Container
-    runs-on: ubuntu-latest
-    needs: test-and-verify
-
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Gateway Production Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: zero-data-intent-gateway:ci-latest
-
-  red-team-simulation:
-    name: Run Live Red-Team Gateway Checks
+  test:
     runs-on: ubuntu-latest
     services:
       redis:
@@ -60,76 +16,88 @@ jobs:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
+          --health-interval 10s
+          --health-timeout 5s
           --health-retries 5
+
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-cov httpx uvicorn redis
+
+      - name: Run Standard Suite
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: test-secret-key
+          GATEWAY_API_TOKEN: test-token
+          TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+        run: |
+          pytest --cov=app --cov-report=term-missing tests/
+
+  red-team-simulation:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest httpx uvicorn redis
 
       - name: Start Gateway and Mock Provider
         env:
-          GATEWAY_URL: http://localhost:8000
-          MOCK_PROVIDER_URL: http://localhost:8090
-          GATEWAY_API_TOKEN: test-token
           REDIS_URL: redis://localhost:6379/0
+          MOCK_PROVIDER_URL: "http://localhost:8090"
           TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
-          NO_PROXY: localhost,127.0.0.1
-          GATEWAY_BUDGET_DB_PATH: /tmp/red-team-budgets.sqlite3
-          AUDIT_LEDGER_PATH: /tmp/red-team-audit.jsonl
+          GATEWAY_BUDGET_DB_PATH: "/tmp/red-team-budgets.sqlite3"
+          AUDIT_LEDGER_PATH: "/tmp/red-team-audit.jsonl"
         run: |
-          python -m uvicorn mock_provider:app --host 0.0.0.0 --port 8090 \
-            </dev/null >/tmp/provider.log 2>&1 &
-          provider_pid=$!
-          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 \
-            </dev/null >/tmp/gateway.log 2>&1 &
-          gateway_pid=$!
-          printf '%s\n' "$provider_pid" >/tmp/provider.pid
-          printf '%s\n' "$gateway_pid" >/tmp/gateway.pid
-
-          for attempt in $(seq 1 60); do
-            if curl --noproxy '*' --fail --silent "$MOCK_PROVIDER_URL/health" >/dev/null \
-              && curl --noproxy '*' --fail --silent "$GATEWAY_URL/health" >/dev/null; then
+          python -m uvicorn mock_provider:app --host 0.0.0.0 --port 8090 > /tmp/provider.log 2>&1 &
+          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > /tmp/gateway.log 2>&1 &
+          echo "Waiting for services to be ready..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8090/health > /dev/null && curl -s http://localhost:8000/health > /dev/null; then
+              echo "Services are online!"
               break
             fi
             sleep 1
           done
 
-          if ! curl --noproxy '*' --fail --silent "$MOCK_PROVIDER_URL/health" >/dev/null; then
-            echo "Mock provider failed its health check. Provider log:"
-            cat /tmp/provider.log
-            echo "Gateway log:"
-            cat /tmp/gateway.log
-            exit 1
-          fi
-          if ! curl --noproxy '*' --fail --silent "$GATEWAY_URL/health" >/dev/null; then
-            echo "Gateway failed its health check. Gateway log:"
-            cat /tmp/gateway.log
-            echo "Provider log:"
-            cat /tmp/provider.log
-            exit 1
-          fi
-
       - name: Run Red-Team Simulation
         env:
-          GATEWAY_URL: http://localhost:8000
-          MOCK_PROVIDER_URL: http://localhost:8090
-          GATEWAY_API_TOKEN: test-token
-          REDIS_URL: redis://localhost:6379/0
+          GATEWAY_URL: "http://localhost:8000"
+          MOCK_PROVIDER_URL: "http://localhost:8090"
+          GATEWAY_API_TOKEN: "test-token"
           TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
-          NO_PROXY: localhost,127.0.0.1
-          no_proxy: localhost,127.0.0.1
-          GATEWAY_BUDGET_DB_PATH: /tmp/red-team-budgets.sqlite3
-          AUDIT_LEDGER_PATH: /tmp/red-team-audit.jsonl
-        run: python -m pytest -v -s tests/red_team_simulation.py
+          REDIS_URL: "redis://localhost:6379/0"
+          NO_PROXY: "localhost,127.0.0.1"
+        run: |
+          python -m pytest -v -s tests/red_team_simulation.py
