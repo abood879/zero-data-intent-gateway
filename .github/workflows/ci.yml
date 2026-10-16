@@ -72,33 +72,32 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest httpx uvicorn redis
 
-      - name: Run Red-Team Simulation Test Pipeline
+      - name: Start Mock Provider
+        env:
+          REDIS_URL: "redis://localhost:6379/0"
+        run: |
+          nohup python -m uvicorn mock_provider:app --host 127.0.0.1 --port 8090 > /tmp/provider.log 2>&1 &
+          sleep 2
+
+      - name: Start Gateway Server
         env:
           REDIS_URL: "redis://localhost:6379/0"
           MOCK_PROVIDER_URL: "http://127.0.0.1:8090"
-          GATEWAY_URL: "http://127.0.0.1:8000"
           GATEWAY_API_TOKEN: "test-token"
           TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
           GATEWAY_BUDGET_DB_PATH: "/tmp/red-team-budgets.sqlite3"
           AUDIT_LEDGER_PATH: "/tmp/red-team-audit.jsonl"
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/gateway.log 2>&1 &
+          sleep 3
+
+      - name: Run Red-Team Simulation Tests
+        env:
+          GATEWAY_URL: "http://127.0.0.1:8000"
+          MOCK_PROVIDER_URL: "http://127.0.0.1:8090"
+          GATEWAY_API_TOKEN: "test-token"
+          TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+          REDIS_URL: "redis://localhost:6379/0"
           NO_PROXY: "localhost,127.0.0.1"
         run: |
-          python -m uvicorn mock_provider:app --host 127.0.0.1 --port 8090 &
-          PID_PROVIDER=$!
-          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-          PID_GATEWAY=$!
-          
-          echo "Waiting for Gateway and Provider services..."
-          for i in $(seq 1 30); do
-            if curl -s http://127.0.0.1:8090/health > /dev/null && curl -s http://127.0.0.1:8000/health > /dev/null; then
-              echo "Services successfully started!"
-              break
-            fi
-            sleep 1
-          done
-
           python -m pytest -v -s tests/red_team_simulation.py
-          TEST_EXIT_CODE=$?
-
-          kill $PID_PROVIDER $PID_GATEWAY || true
-          exit $TEST_EXIT_CODE
