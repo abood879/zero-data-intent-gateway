@@ -63,13 +63,6 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 5
-    env:
-      GATEWAY_URL: http://127.0.0.1:8000
-      MOCK_PROVIDER_URL: http://127.0.0.1:8090
-      GATEWAY_API_TOKEN: test-token
-      REDIS_URL: redis://127.0.0.1:6379/0
-      TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
-
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
@@ -87,36 +80,56 @@ jobs:
 
       - name: Start Gateway and Mock Provider
         env:
+          GATEWAY_URL: http://localhost:8000
+          MOCK_PROVIDER_URL: http://localhost:8090
+          GATEWAY_API_TOKEN: test-token
+          REDIS_URL: redis://localhost:6379/0
+          TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+          NO_PROXY: localhost,127.0.0.1
           GATEWAY_BUDGET_DB_PATH: /tmp/red-team-budgets.sqlite3
           AUDIT_LEDGER_PATH: /tmp/red-team-audit.jsonl
         run: |
           python -m uvicorn mock_provider:app --host 0.0.0.0 --port 8090 \
-            >"${RUNNER_TEMP}/mock-provider.log" 2>&1 &
+            </dev/null >/tmp/provider.log 2>&1 &
           provider_pid=$!
           python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 \
-            >"${RUNNER_TEMP}/gateway.log" 2>&1 &
+            </dev/null >/tmp/gateway.log 2>&1 &
           gateway_pid=$!
-          cleanup() {
-            kill "$gateway_pid" "$provider_pid" 2>/dev/null || true
-            wait "$gateway_pid" "$provider_pid" 2>/dev/null || true
-          }
-          trap cleanup EXIT
+          printf '%s\n' "$provider_pid" >/tmp/provider.pid
+          printf '%s\n' "$gateway_pid" >/tmp/gateway.pid
 
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8090/health >/dev/null \
-              && curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
+          for attempt in $(seq 1 60); do
+            if curl --noproxy '*' --fail --silent "$MOCK_PROVIDER_URL/health" >/dev/null \
+              && curl --noproxy '*' --fail --silent "$GATEWAY_URL/health" >/dev/null; then
               break
             fi
             sleep 1
           done
 
-          if ! curl --fail --silent http://127.0.0.1:8090/health >/dev/null; then
-            cat "${RUNNER_TEMP}/mock-provider.log"
+          if ! curl --noproxy '*' --fail --silent "$MOCK_PROVIDER_URL/health" >/dev/null; then
+            echo "Mock provider failed its health check. Provider log:"
+            cat /tmp/provider.log
+            echo "Gateway log:"
+            cat /tmp/gateway.log
             exit 1
           fi
-          if ! curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
-            cat "${RUNNER_TEMP}/gateway.log"
+          if ! curl --noproxy '*' --fail --silent "$GATEWAY_URL/health" >/dev/null; then
+            echo "Gateway failed its health check. Gateway log:"
+            cat /tmp/gateway.log
+            echo "Provider log:"
+            cat /tmp/provider.log
             exit 1
           fi
 
-          python -m pytest -v -s tests/red_team_simulation.py
+      - name: Run Red-Team Simulation
+        env:
+          GATEWAY_URL: http://localhost:8000
+          MOCK_PROVIDER_URL: http://localhost:8090
+          GATEWAY_API_TOKEN: test-token
+          REDIS_URL: redis://localhost:6379/0
+          TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+          NO_PROXY: localhost,127.0.0.1
+          no_proxy: localhost,127.0.0.1
+          GATEWAY_BUDGET_DB_PATH: /tmp/red-team-budgets.sqlite3
+          AUDIT_LEDGER_PATH: /tmp/red-team-audit.jsonl
+        run: python -m pytest -v -s tests/red_team_simulation.py
