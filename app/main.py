@@ -265,10 +265,10 @@ async def proxy_transfer(
     raw_payload = await request.body()
     try:
         payload = json.loads(raw_payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise HTTPException(
             status_code=400,
-            detail="Request body must be valid JSON.",
+            detail=f"Request body must be valid JSON: {str(exc)}",
         ) from exc
     if not isinstance(payload, dict):
         raise HTTPException(
@@ -306,11 +306,24 @@ async def proxy_transfer(
             detail="Idempotency-Key header must match the request payload.",
         )
 
-    recipient = payload.get("recipient") or payload.get("recipient_id") or payload.get("destination_account")
+    recipient_fields = [k for k in ("recipient", "recipient_id", "destination_account") if k in payload]
+    if len(recipient_fields) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ambiguous recipient fields detected: {recipient_fields}. Exactly one recipient field must be provided.",
+        )
+    recipient_candidate = payload.get(recipient_fields[0]) if recipient_fields else None
+    if recipient_candidate is not None and (not isinstance(recipient_candidate, str) or not recipient_candidate.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Recipient identifier must be a valid non-empty string.",
+        )
+    recipient_normalized = str(recipient_candidate).strip() if recipient_candidate else ""
+
     policy_parameters = {
         "amount": payload.get("amount"),
         "currency": payload.get("currency", "USD"),
-        "recipient": str(recipient).strip() if recipient else "",
+        "recipient": recipient_normalized,
     }
     dof, violations, _ = governance_engine.evaluate(
         {
@@ -340,9 +353,16 @@ async def proxy_transfer(
     if not isinstance(currency, str) or not currency.strip():
         raise HTTPException(status_code=400, detail="Transaction currency is invalid.")
 
+    # Unify alternate recipient field into canonical recipient
+    normalized_payload = dict(payload)
+    if "recipient_id" in normalized_payload:
+        normalized_payload["recipient"] = normalized_payload.pop("recipient_id")
+    elif "destination_account" in normalized_payload:
+        normalized_payload["recipient"] = normalized_payload.pop("destination_account")
+
     try:
         canonical_payload = json.dumps(
-            payload,
+            normalized_payload,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,

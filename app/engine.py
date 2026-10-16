@@ -232,6 +232,8 @@ class UnifiedGovernanceEngine:
             self.tool_permissions = {
                 tool: list(roles) for tool, roles in tool_permissions.items()
             }
+            allowed_rec = policy.get("allowed_recipients")
+            self.allowed_recipients = [str(r).strip() for r in allowed_rec] if isinstance(allowed_rec, list) else []
             self.policy_revision = revision
         logger.info(
             "Reloaded gateway policy revision=%s transaction_limits=%s "
@@ -1270,6 +1272,14 @@ class UnifiedGovernanceEngine:
             return dof, violations, metadata
 
         if tool == "wire_transfer":
+            recipient_val = params.get("recipient")
+            if recipient_val is not None:
+                if not isinstance(recipient_val, str) or not recipient_val.strip():
+                    violations.append("Recipient identifier must be a non-empty string.")
+                    dof += 2
+                elif self.allowed_recipients and recipient_val.strip() not in self.allowed_recipients:
+                    violations.append(f"Recipient '{recipient_val}' is not in allowed recipient policy")
+                    dof += 2
             amount_raw = params.get("amount")
             if amount_raw is None:
                 violations.append("Parameter 'amount' is mandatory for wire_transfer")

@@ -292,3 +292,59 @@ def test_policy_reload_requires_admin_role(proxy_client):
         headers={"Authorization": "Bearer proxy-test-token"},
     )
     assert response.status_code == 403
+
+
+def test_proxy_rejects_duplicate_json_keys_with_400(proxy_client, monkeypatch):
+    calls = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"status": "succeeded"})
+
+    _patch_provider(monkeypatch, mock_handler)
+
+    raw_duplicate_key_json = b'{"amount":"10.00","currency":"USD","recipient":"account-1","idempotency_key":"dup-1","amount":"20.00"}'
+    response = proxy_client.post(
+        "/v1/proxy/transfers",
+        content=raw_duplicate_key_json,
+        headers={
+            **_headers("dup-1"),
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 400
+    assert "Duplicate JSON key detected" in response.text
+    assert len(calls) == 0, "No request should be dispatched to downstream provider"
+
+
+def test_proxy_rejects_ambiguous_recipient_fields(proxy_client):
+    payload = {
+        "amount": "10.00",
+        "currency": "USD",
+        "recipient": "account-1",
+        "destination_account": "account-2",
+        "idempotency_key": "ambig-1",
+    }
+    response = proxy_client.post(
+        "/v1/proxy/transfers",
+        json=payload,
+        headers=_headers("ambig-1"),
+    )
+    assert response.status_code == 400
+    assert "Ambiguous recipient fields detected" in response.text
+
+
+def test_proxy_rejects_disallowed_recipient_policy(proxy_client):
+    payload = {
+        "amount": "10.00",
+        "currency": "USD",
+        "recipient": "forbidden_external_wallet",
+        "idempotency_key": "forbidden-rec-1",
+    }
+    response = proxy_client.post(
+        "/v1/proxy/transfers",
+        json=payload,
+        headers=_headers("forbidden-rec-1"),
+    )
+    assert response.status_code == 403
+    assert "forbidden_external_wallet" in response.text
