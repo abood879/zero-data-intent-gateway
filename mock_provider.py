@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -85,6 +86,7 @@ async def create_transfer(
     payload["currency"] = transfer.currency.upper()
     async with _transfer_lock:
         existing = _transfers.get(transfer.idempotency_key)
+        is_first_dispatch = existing is None
         if existing is not None:
             if existing["payload"] != payload:
                 raise HTTPException(
@@ -116,9 +118,14 @@ async def create_transfer(
             }
 
     should_drop = (
-        _drop_enabled() if drop_after_accept is None else drop_after_accept
+        _drop_enabled()
+        or (drop_after_accept is True)
+        or ("drop" in transfer.idempotency_key.lower())
+        or ("drop" in (idempotency_header or "").lower())
     )
-    if should_drop:
+
+    if should_drop and is_first_dispatch:
+        print(f"MOCK_PROVIDER: Withholding response for dropped transfer {transfer.idempotency_key}", file=sys.stderr, flush=True)
         return StreamingResponse(
             _withhold_response(),
             media_type="application/json",
