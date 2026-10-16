@@ -1,12 +1,14 @@
 ﻿import os
 import uuid
 import asyncio
+import sqlite3
 import pytest
 import httpx
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
 MOCK_PROVIDER_URL = os.getenv("MOCK_PROVIDER_URL", "http://127.0.0.1:8090")
 GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "test-token")
+GATEWAY_BUDGET_DB_PATH = os.getenv("GATEWAY_BUDGET_DB_PATH", "/tmp/red-team-budgets.sqlite3")
 
 
 def _headers(idempotency_key: str) -> dict:
@@ -126,7 +128,7 @@ async def test_drop_after_accept_recovery_prevents_duplicate_dispatch_and_flags_
     3. Client retries with the same Idempotency-Key.
     4. Gateway blocks duplicate execution with 409 Conflict.
     5. Mock provider verifies dispatch_count remains exactly 1 and transfer status is 'succeeded'.
-    6. Cumulative budget reservation in SQLite is verified to be RECONCILIATION_REQUIRED.
+    6. Cumulative budget reservation in SQLite is STRICTLY verified to be RECONCILIATION_REQUIRED.
     """
     idempotency_key = f"red-team-drop-accept-{uuid.uuid4().hex}"
     payload = {
@@ -165,16 +167,16 @@ async def test_drop_after_accept_recovery_prevents_duplicate_dispatch_and_flags_
             f"Financial Invariance Violation! Expected dispatch_count == 1, got {provider_data.get('dispatch_count')}"
         )
 
-    # Step 6: Verify gateway budget audit ledger in SQLite
-    db_path = os.getenv("GATEWAY_BUDGET_DB_PATH", "/tmp/red-team-budgets.sqlite3")
-    if os.path.exists(db_path):
-        import sqlite3
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT status FROM cumulative_budget_reservations WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            assert row is not None, "Budget reservation record not found in database."
-            assert row[0] == "RECONCILIATION_REQUIRED", (
-                f"Expected reservation status RECONCILIATION_REQUIRED, got {row[0]}"
-            )
+    # Step 6: Mandatory SQLite verification - Failure is explicit if database or record is missing
+    assert os.path.exists(GATEWAY_BUDGET_DB_PATH), (
+        f"Critical Failure: Budget database file not found at {GATEWAY_BUDGET_DB_PATH}"
+    )
+    with sqlite3.connect(GATEWAY_BUDGET_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT status FROM cumulative_budget_reservations WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        assert row is not None, f"Critical Failure: Reservation record for {idempotency_key} missing from SQLite."
+        assert row[0] == "RECONCILIATION_REQUIRED", (
+            f"Financial Invariance Violation: Expected RECONCILIATION_REQUIRED, got {row[0]}"
+        )

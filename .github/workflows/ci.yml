@@ -101,6 +101,7 @@ jobs:
           MOCK_PROVIDER_URL: "http://127.0.0.1:8090"
           GATEWAY_API_TOKEN: "test-token"
           TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
+          GATEWAY_BUDGET_DB_PATH: "/tmp/red-team-budgets.sqlite3"
           REDIS_URL: "redis://localhost:6379/0"
           NO_PROXY: "localhost,127.0.0.1"
         run: |
