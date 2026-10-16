@@ -69,14 +69,12 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
                 headers=_headers(idempotency_key),
             )
 
-    # إرسال طلبين متزامنين بنفس مفتاح عدم التكرار
     responses = await asyncio.gather(_send(), _send())
     status_codes = [r.status_code for r in responses]
 
     assert 200 in status_codes, f"Expected at least one 200 OK, got: {status_codes}"
     assert all(code in (200, 409) for code in status_codes), f"Unexpected status codes: {status_codes}"
 
-    # إثبات الحصانة المالية: المزود الخارجي يجب أن يسجل تنفيذاً واحداً فقط
     async with httpx.AsyncClient(timeout=10.0) as client:
         provider_lookup = await client.get(
             f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
@@ -90,7 +88,6 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
 
 @pytest.mark.asyncio
 async def test_sequential_duplicate_request_returns_cached_or_rejected_without_re_dispatch():
-    """Verify that repeating a request after completion does not re-dispatch to the provider."""
     idempotency_key = f"red-team-replay-{uuid.uuid4().hex}"
     payload = {
         "amount": "5.00",
@@ -100,7 +97,6 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # الطلب الأول
         res1 = await client.post(
             f"{GATEWAY_URL}/v1/proxy/transfers",
             json=payload,
@@ -108,7 +104,6 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
         )
         assert res1.status_code == 200, f"Initial request failed: {res1.text}"
 
-        # الطلب المكرر اللاحق
         res2 = await client.post(
             f"{GATEWAY_URL}/v1/proxy/transfers",
             json=payload,
@@ -116,9 +111,70 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
         )
         assert res2.status_code in (200, 409), f"Unexpected replay status: {res2.status_code}"
 
-        # التحقق من أن المزود لم يستلم أي طلب إضافي وظل العدد 1 بالضبط
         provider_lookup = await client.get(
             f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
         )
         assert provider_lookup.status_code == 200
         assert provider_lookup.json()["dispatch_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drop_after_accept_recovery_prevents_duplicate_dispatch_and_flags_reconciliation():
+    """Verify recovery when provider accepts transfer but response is dropped/timed out:
+    1. Provider accepts transfer and records dispatch_count == 1, then withholds response.
+    2. Gateway times out and returns 502 (flagging transaction for reconciliation).
+    3. Client retries with the same Idempotency-Key.
+    4. Gateway blocks duplicate execution with 409 Conflict.
+    5. Mock provider verifies dispatch_count remains exactly 1 and transfer status is 'succeeded'.
+    6. Cumulative budget reservation in SQLite is verified to be RECONCILIATION_REQUIRED.
+    """
+    idempotency_key = f"red-team-drop-accept-{uuid.uuid4().hex}"
+    payload = {
+        "amount": "15.00",
+        "currency": "USD",
+        "recipient": "merchant_wallet",
+        "idempotency_key": idempotency_key,
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # Step 1 & 2: First attempt triggers provider accept + withheld response -> gateway 502
+        res1 = await client.post(
+            f"{GATEWAY_URL}/v1/proxy/transfers",
+            json=payload,
+            headers=_headers(idempotency_key),
+        )
+        assert res1.status_code == 502, f"Expected 502 on dropped response, got: {res1.status_code} ({res1.text})"
+        assert "reconciliation" in res1.text.lower() or "uncertain" in res1.text.lower()
+
+        # Step 3 & 4: Retry with same key while pending reconciliation -> gateway blocks with 409
+        res2 = await client.post(
+            f"{GATEWAY_URL}/v1/proxy/transfers",
+            json=payload,
+            headers=_headers(idempotency_key),
+        )
+        assert res2.status_code == 409, f"Expected 409 Conflict on retry of unconfirmed transaction, got: {res2.status_code}"
+
+        # Step 5: Verify external provider state (strict invariance: accepted once, never re-dispatched)
+        provider_lookup = await client.get(
+            f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
+        )
+        assert provider_lookup.status_code == 200, f"Provider lookup failed: {provider_lookup.text}"
+        provider_data = provider_lookup.json()
+        assert provider_data["status"] == "succeeded"
+        assert provider_data["dispatch_count"] == 1, (
+            f"Financial Invariance Violation! Expected dispatch_count == 1, got {provider_data.get('dispatch_count')}"
+        )
+
+    # Step 6: Verify gateway budget audit ledger in SQLite
+    db_path = os.getenv("GATEWAY_BUDGET_DB_PATH", "/tmp/red-team-budgets.sqlite3")
+    if os.path.exists(db_path):
+        import sqlite3
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM cumulative_budget_reservations WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            assert row is not None, "Budget reservation record not found in database."
+            assert row[0] == "RECONCILIATION_REQUIRED", (
+                f"Expected reservation status RECONCILIATION_REQUIRED, got {row[0]}"
+            )
