@@ -69,8 +69,6 @@ jobs:
       GATEWAY_API_TOKEN: test-token
       REDIS_URL: redis://127.0.0.1:6379/0
       TOKEN_IDENTITY_MAP: '{"test-token":{"role":"finance_agent","user_id":"red-team-agent"}}'
-      GATEWAY_BUDGET_DB_PATH: ${{ runner.temp }}/red-team-budgets.sqlite3
-      AUDIT_LEDGER_PATH: ${{ runner.temp }}/red-team-audit.jsonl
 
     steps:
       - name: Checkout Source Code
@@ -88,6 +86,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Start Gateway and Mock Provider
+        env:
+          GATEWAY_BUDGET_DB_PATH: /tmp/red-team-budgets.sqlite3
+          AUDIT_LEDGER_PATH: /tmp/red-team-audit.jsonl
         run: |
           python -m uvicorn mock_provider:app --host 0.0.0.0 --port 8090 \
             >"${RUNNER_TEMP}/mock-provider.log" 2>&1 &

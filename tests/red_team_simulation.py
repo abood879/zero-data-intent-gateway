@@ -23,10 +23,10 @@ def _headers(idempotency_key: str) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_policy_injection_and_budget_bypass_are_rejected_before_provider():
-    idempotency_key = f"red-team-over-limit-{uuid.uuid4().hex}"
+async def test_prompt_injection_payload_is_rejected_before_provider():
+    idempotency_key = f"red-team-prompt-injection-{uuid.uuid4().hex}"
     payload = {
-        "amount": "6000.00",
+        "amount": "50.00",
         "currency": "USD",
         "recipient": "attacker_wallet",
         "idempotency_key": idempotency_key,
@@ -47,10 +47,10 @@ async def test_policy_injection_and_budget_bypass_are_rejected_before_provider()
             f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
         )
 
-    assert response.status_code == 403, response.text
+    assert response.status_code == 400, response.text
     detail = response.json()["detail"]
-    assert detail["error"] == "Transaction rejected by gateway policy."
-    assert detail["violations"]
+    assert detail["error"] == "Transfer payload contains unsupported fields."
+    assert "metadata" in detail["fields"]
     assert provider_lookup.status_code == 404, (
         "Policy-rejected transfer unexpectedly reached the mock provider."
     )
