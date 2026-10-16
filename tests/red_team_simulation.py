@@ -8,7 +8,6 @@ import httpx
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000")
 MOCK_PROVIDER_URL = os.getenv("MOCK_PROVIDER_URL", "http://127.0.0.1:8090")
 GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "test-token")
-GATEWAY_BUDGET_DB_PATH = os.getenv("GATEWAY_BUDGET_DB_PATH", "/tmp/red-team-budgets.sqlite3")
 
 
 def _headers(idempotency_key: str) -> dict:
@@ -18,6 +17,15 @@ def _headers(idempotency_key: str) -> dict:
         "X-Idempotency-Key": idempotency_key,
         "Content-Type": "application/json",
     }
+
+
+def _resolve_budget_db_path() -> str:
+    env_path = os.getenv("GATEWAY_BUDGET_DB_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    if os.path.exists("/tmp/red-team-budgets.sqlite3"):
+        return "/tmp/red-team-budgets.sqlite3"
+    return env_path or "/tmp/red-team-budgets.sqlite3"
 
 
 @pytest.mark.asyncio
@@ -168,10 +176,11 @@ async def test_drop_after_accept_recovery_prevents_duplicate_dispatch_and_flags_
         )
 
     # Step 6: Mandatory SQLite verification - Failure is explicit if database or record is missing
-    assert os.path.exists(GATEWAY_BUDGET_DB_PATH), (
-        f"Critical Failure: Budget database file not found at {GATEWAY_BUDGET_DB_PATH}"
+    target_db = _resolve_budget_db_path()
+    assert os.path.exists(target_db), (
+        f"Critical Failure: Budget database file not found at {target_db}"
     )
-    with sqlite3.connect(GATEWAY_BUDGET_DB_PATH) as conn:
+    with sqlite3.connect(target_db) as conn:
         row = conn.execute(
             "SELECT status FROM cumulative_budget_reservations WHERE idempotency_key = ?",
             (idempotency_key,),
