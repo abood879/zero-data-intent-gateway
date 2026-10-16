@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
+COPY config/ ./config/
 COPY sdk.py agent.py ./
 
 CMD ["sh", "-c", "sleep 5 && python agent.py"]
