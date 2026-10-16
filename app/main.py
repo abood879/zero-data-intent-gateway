@@ -266,6 +266,24 @@ async def proxy_transfer(
             status_code=400,
             detail="Transfer payload must be a JSON object.",
         )
+    allowed_payload_fields = {
+        "amount",
+        "currency",
+        "recipient",
+        "recipient_id",
+        "destination_account",
+        "description",
+        "idempotency_key",
+    }
+    unsupported_fields = sorted(set(payload) - allowed_payload_fields)
+    if unsupported_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Transfer payload contains unsupported fields: "
+                + ", ".join(unsupported_fields)
+            ),
+        )
 
     idempotency_key = request.headers.get("Idempotency-Key")
     payload_key = payload.get("idempotency_key")
