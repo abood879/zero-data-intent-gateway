@@ -1,16 +1,31 @@
+import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import hashlib
 import json
+import logging
 import os
 import secrets
 import threading
 import time
-from fastapi import Depends, FastAPI, HTTPException, Response, Security
+from decimal import Decimal, InvalidOperation
+from typing import AsyncIterator
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from typing import Any, Dict
-from app.engine import governance_engine
+import redis.asyncio as redis_async
+from redis.exceptions import LockNotOwnedError, RedisError
+from app.engine import (
+    IdempotencyConflictError,
+    UnsupportedCurrencyError,
+    governance_engine,
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Zero-Data Intent Governance Gateway",
@@ -177,6 +192,279 @@ def observe_transaction(status: str, dof: int, started_at: float) -> None:
         dof=str(dof),
         engine_source="UnifiedGovernanceEngine",
     ).inc()
+
+
+@asynccontextmanager
+async def _idempotency_lock(idempotency_key: str) -> AsyncIterator[None]:
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        yield
+        return
+
+    try:
+        redis_client = redis_async.from_url(redis_url, decode_responses=True)
+    except (RedisError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Idempotency lock service is unavailable.",
+        ) from exc
+    lock_name = (
+        "gateway:idempotency:"
+        + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    )
+    lock = redis_client.lock(
+        lock_name,
+        timeout=60,
+        blocking_timeout=15,
+    )
+    try:
+        acquired = await lock.acquire()
+    except RedisError as exc:
+        await redis_client.aclose()
+        raise HTTPException(
+            status_code=503,
+            detail="Idempotency lock service is unavailable.",
+        ) from exc
+    if not acquired:
+        await redis_client.aclose()
+        raise HTTPException(
+            status_code=409,
+            detail="A request with this idempotency key is already in progress.",
+        )
+
+    try:
+        yield
+    finally:
+        try:
+            await lock.release()
+        except (LockNotOwnedError, RedisError) as exc:
+            logger.exception("Could not release distributed idempotency lock.")
+            raise HTTPException(
+                status_code=503,
+                detail="Idempotency lock could not be safely released.",
+            ) from exc
+        finally:
+            await redis_client.aclose()
+
+
+@app.post("/v1/proxy/transfers")
+async def proxy_transfer(
+    request: Request,
+    identity: dict[str, str] = Depends(verify_token_identity),
+) -> Response:
+    started_at = time.perf_counter()
+    raw_payload = await request.body()
+    try:
+        payload = json.loads(raw_payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must be valid JSON.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Transfer payload must be a JSON object.",
+        )
+
+    idempotency_key = request.headers.get("Idempotency-Key")
+    payload_key = payload.get("idempotency_key")
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key.strip()
+        or payload_key != idempotency_key
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header must match the request payload.",
+        )
+
+    policy_parameters = {
+        "amount": payload.get("amount"),
+        "currency": payload.get("currency", "USD"),
+    }
+    dof, violations, _ = governance_engine.evaluate(
+        {
+            "tool": "wire_transfer",
+            "parameters": policy_parameters,
+            "context": identity,
+        }
+    )
+    if dof != 0:
+        observe_transaction("DENIED", dof, started_at)
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "Transaction rejected by gateway policy.",
+                "violations": violations,
+            },
+        )
+
+    try:
+        amount = Decimal(str(policy_parameters["amount"]))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Transaction amount is invalid.",
+        ) from exc
+    currency = policy_parameters["currency"]
+    if not isinstance(currency, str) or not currency.strip():
+        raise HTTPException(status_code=400, detail="Transaction currency is invalid.")
+
+    try:
+        canonical_payload = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Transfer payload is not valid JSON.",
+        ) from exc
+    payload_hash = hashlib.sha256(canonical_payload).hexdigest()
+    async with _idempotency_lock(idempotency_key):
+        try:
+            (
+                reserved,
+                _,
+                reservation_id,
+                execution_token,
+                cached_confirmation,
+            ) = await asyncio.to_thread(
+                governance_engine.reserve_budget_with_confirmation,
+                identity["role"],
+                identity["user_id"],
+                amount,
+                idempotency_key,
+                currency,
+                "wire_transfer",
+                payload_hash,
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except UnsupportedCurrencyError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not reserved:
+            raise HTTPException(
+                status_code=403,
+                detail="Cumulative financial budget exceeded for this identity and time window.",
+            )
+        if cached_confirmation is not None:
+            observe_transaction("IDEMPOTENT_REPLAY", dof, started_at)
+            return JSONResponse(content=cached_confirmation)
+        if reservation_id is None or execution_token is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Gateway could not reserve the transaction.",
+            )
+
+        provider_url = os.getenv(
+            "MOCK_PROVIDER_URL", "http://mock-provider:8090"
+        ).rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                provider_response = await client.post(
+                    f"{provider_url}/v1/transfers",
+                    content=raw_payload,
+                    headers={
+                        "Content-Type": request.headers.get(
+                            "content-type", "application/json"
+                        ),
+                        "Idempotency-Key": idempotency_key,
+                    },
+                )
+        except httpx.RequestError as exc:
+            await asyncio.to_thread(
+                governance_engine.flag_for_reconciliation,
+                reservation_id,
+            )
+            observe_transaction("PROVIDER_OUTCOME_UNCERTAIN", dof, started_at)
+            raise HTTPException(
+                status_code=502,
+                detail="Provider outcome is uncertain; transaction requires reconciliation.",
+            ) from exc
+
+        if 200 <= provider_response.status_code < 300:
+            try:
+                await asyncio.to_thread(
+                    governance_engine.commit_budget,
+                    reservation_id,
+                    execution_token,
+                )
+            except RuntimeError as exc:
+                await asyncio.to_thread(
+                    governance_engine.flag_for_reconciliation,
+                    reservation_id,
+                )
+                observe_transaction("COMMIT_RECONCILIATION_REQUIRED", dof, started_at)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Provider accepted the transfer but gateway commit requires reconciliation.",
+                ) from exc
+            await asyncio.to_thread(
+                governance_engine.mark_idempotency_status,
+                idempotency_key,
+                "COMMITTED",
+            )
+            observe_transaction("PROVIDER_SUCCEEDED", dof, started_at)
+        elif 400 <= provider_response.status_code < 500 and provider_response.status_code not in {
+            408,
+            409,
+            425,
+            429,
+        }:
+            await asyncio.to_thread(
+                governance_engine.release_budget,
+                reservation_id,
+            )
+            await asyncio.to_thread(
+                governance_engine.mark_idempotency_status,
+                idempotency_key,
+                "ABORTED",
+            )
+            observe_transaction("PROVIDER_REJECTED", dof, started_at)
+        else:
+            await asyncio.to_thread(
+                governance_engine.flag_for_reconciliation,
+                reservation_id,
+            )
+            observe_transaction("PROVIDER_OUTCOME_UNCERTAIN", dof, started_at)
+
+        response_headers = {}
+        content_type = provider_response.headers.get("content-type")
+        if content_type:
+            response_headers["content-type"] = content_type
+        return Response(
+            content=provider_response.content,
+            status_code=provider_response.status_code,
+            headers=response_headers,
+        )
+
+
+@app.post("/v1/admin/reload-policies")
+async def reload_policies(
+    identity: dict[str, str] = Depends(verify_token_identity),
+) -> dict[str, str]:
+    if identity["role"] not in {"admin", "governance_admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only an administrator may reload gateway policies.",
+        )
+    try:
+        revision = await asyncio.to_thread(governance_engine.reload_policies)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.exception("Gateway policy reload failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway policies could not be reloaded.",
+        ) from exc
+    return {"status": "reloaded", "policy_revision": revision}
+
 
 @app.get("/health")
 def health():

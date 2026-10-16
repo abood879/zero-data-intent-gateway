@@ -5,12 +5,15 @@ import hmac
 import logging
 import math
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -55,28 +58,19 @@ class UnsupportedCurrencyError(SecurityViolationError):
 
 
 class UnifiedGovernanceEngine:
-    def __init__(self, budget_db_path: str | Path | None = None):
-        self.critical_financial_limits = dict(CRITICAL_FINANCIAL_LIMITS)
-        critical_limit_prefix = "GATEWAY_CRITICAL_LIMIT_"
-        for setting, configured_limit in os.environ.items():
-            if not setting.startswith(critical_limit_prefix):
-                continue
-            currency = setting[len(critical_limit_prefix) :].upper()
-            if len(currency) != 3 or not currency.isalpha():
-                raise ValueError(
-                    f"{setting} must use a three-letter currency code."
-                )
-            try:
-                parsed_limit = Decimal(configured_limit)
-            except InvalidOperation as exc:
-                raise ValueError(
-                    f"{setting} must be a decimal."
-                ) from exc
-            if not parsed_limit.is_finite() or parsed_limit <= 0:
-                raise ValueError(
-                    f"{setting} must be positive."
-                )
-            self.critical_financial_limits[currency] = parsed_limit
+    def __init__(
+        self,
+        budget_db_path: str | Path | None = None,
+        policy_file_path: str | Path | None = None,
+    ):
+        self._policy_lock = threading.RLock()
+        self.policy_file_path = Path(
+            policy_file_path
+            or os.getenv(
+                "GATEWAY_POLICY_FILE",
+                Path(__file__).resolve().parents[1] / "config" / "policies.yaml",
+            )
+        )
         self.budget_window_seconds = int(
             os.getenv("GATEWAY_BUDGET_WINDOW_SECONDS", "3600")
         )
@@ -88,69 +82,165 @@ class UnifiedGovernanceEngine:
         if self.reservation_ttl_seconds <= 0:
             raise ValueError("GATEWAY_BUDGET_RESERVATION_TTL_SECONDS must be positive.")
 
-        self.tool_permissions = {
-            "database_drop": ["superadmin"],
-            "admin_execute": ["admin"],
-            "wire_transfer": ["finance_agent", "finance_operator", "admin"],
-            "read_records": ["guest", "agent", "support_agent", "finance_agent", "admin"]
-        }
-        self.role_limits = {
-            "finance_agent": Decimal("5000.00"),
-            "admin": Decimal("10000.00"),
-            "agent": Decimal("500.00"),
-        }
-        self.role_budget_limits = {
-            "finance_agent": Decimal("10000.00"),
-            "finance_operator": Decimal("10000.00"),
-            "admin": Decimal("25000.00"),
-            "agent": Decimal("2000.00"),
-        }
-        self.role_currency_budget_limits = {
-            role: {"USD": limit} for role, limit in self.role_budget_limits.items()
-        }
-        self.role_currency_budget_limits["finance_agent"]["EUR"] = Decimal("9000.00")
-        self.role_currency_budget_limits["finance_operator"]["EUR"] = Decimal("9000.00")
-        self.role_currency_budget_limits["admin"]["EUR"] = Decimal("20000.00")
+        self.budget_db_path = Path(
+            budget_db_path
+            or os.getenv("GATEWAY_BUDGET_DB_PATH", "cumulative_budgets.sqlite3")
+        )
+        self.reload_policies()
+        self._initialize_budget_store()
+
+    @staticmethod
+    def _parse_currency_limits(
+        values: Any,
+        setting_name: str,
+        *,
+        flat_currency_map: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(values, dict) or not values:
+            raise ValueError(f"{setting_name} must be a non-empty mapping.")
+
+        parsed: dict[str, Any] = {}
+        for name, limits in values.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{setting_name} contains an empty name.")
+            if flat_currency_map:
+                currency, raw_limit = name, limits
+            else:
+                if not isinstance(limits, dict) or not limits:
+                    raise ValueError(
+                        f"{setting_name} for {name!r} must be a non-empty currency mapping."
+                    )
+                role_limits = {}
+                for currency, raw_limit in limits.items():
+                    if not isinstance(currency, str) or len(currency.strip()) != 3:
+                        raise ValueError(
+                            f"{setting_name} currency codes must contain three letters."
+                        )
+                    try:
+                        parsed_limit = Decimal(str(raw_limit))
+                    except InvalidOperation as exc:
+                        raise ValueError(
+                            f"{setting_name} for {name!r}/{currency} must be a decimal."
+                        ) from exc
+                    if not parsed_limit.is_finite() or parsed_limit <= 0:
+                        raise ValueError(
+                            f"{setting_name} for {name!r}/{currency} must be positive."
+                        )
+                    role_limits[currency.strip().upper()] = parsed_limit
+                parsed[name] = role_limits
+                continue
+
+            if not isinstance(currency, str) or len(currency.strip()) != 3:
+                raise ValueError(f"{setting_name} currency codes must contain three letters.")
+            try:
+                parsed_limit = Decimal(str(raw_limit))
+            except InvalidOperation as exc:
+                raise ValueError(
+                    f"{setting_name} for {currency} must be a decimal."
+                ) from exc
+            if not parsed_limit.is_finite() or parsed_limit <= 0:
+                raise ValueError(f"{setting_name} for {currency} must be positive.")
+            parsed[currency.strip().upper()] = parsed_limit
+        return parsed
+
+    def reload_policies(self) -> str:
+        try:
+            policy_content = self.policy_file_path.read_bytes()
+            policy_document = yaml.safe_load(policy_content.decode("utf-8-sig"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                f"Could not load gateway policy file {self.policy_file_path}."
+            ) from exc
+        if not isinstance(policy_document, dict):
+            raise ValueError("Gateway policy file must contain a YAML mapping.")
+        policy = policy_document.get("gateway_policy")
+        if not isinstance(policy, dict):
+            raise ValueError("Gateway policy file must define a gateway_policy mapping.")
+
+        critical_limits = self._parse_currency_limits(
+            policy.get("critical_financial_limits"),
+            "critical_financial_limits",
+            flat_currency_map=True,
+        )
+        for setting, configured_limit in os.environ.items():
+            if not setting.startswith("GATEWAY_CRITICAL_LIMIT_"):
+                continue
+            currency = setting[len("GATEWAY_CRITICAL_LIMIT_") :].upper()
+            critical_limits.update(
+                self._parse_currency_limits(
+                    {currency: configured_limit},
+                    setting,
+                    flat_currency_map=True,
+                )
+            )
+
+        transaction_limits = self._parse_currency_limits(
+            policy.get("role_transaction_limits"),
+            "role_transaction_limits",
+        )
+        budget_limits = self._parse_currency_limits(
+            policy.get("role_budget_limits"),
+            "role_budget_limits",
+        )
         configured_budget_limits = json.loads(
             os.getenv("GATEWAY_ROLE_BUDGET_LIMITS", "{}")
         )
         if not isinstance(configured_budget_limits, dict):
             raise ValueError("GATEWAY_ROLE_BUDGET_LIMITS must be a JSON object.")
-        for role, limit in configured_budget_limits.items():
+        for role, configured_limits in configured_budget_limits.items():
             if not isinstance(role, str) or not role:
                 raise ValueError("Cumulative budget role names must be non-empty strings.")
-            limits_by_currency = limit if isinstance(limit, dict) else {"USD": limit}
-            parsed_limits = {}
-            for currency, currency_limit in limits_by_currency.items():
-                if not isinstance(currency, str) or not currency.strip():
-                    raise ValueError("Budget currency codes must be non-empty strings.")
-                try:
-                    parsed_limit = Decimal(str(currency_limit))
-                except InvalidOperation as exc:
-                    raise ValueError(
-                        f"Cumulative budget limit for {role!r}/{currency} must be a decimal."
-                    ) from exc
-                if not parsed_limit.is_finite() or parsed_limit <= 0:
-                    raise ValueError(
-                        f"Cumulative budget limit for {role!r}/{currency} must be positive."
-                    )
-                parsed_limits[currency.strip().upper()] = parsed_limit
-            if not parsed_limits:
-                raise ValueError(f"Cumulative budget limits for {role!r} cannot be empty.")
-            self.role_currency_budget_limits[role] = parsed_limits
-            if "USD" in parsed_limits:
-                self.role_budget_limits[role] = parsed_limits["USD"]
-        logger.info(
-            "Active financial policy: transaction_limits=%s cumulative_limits=%s",
-            self.critical_financial_limits,
-            self.role_currency_budget_limits,
-        )
+            role_limits = (
+                configured_limits
+                if isinstance(configured_limits, dict)
+                else {"USD": configured_limits}
+            )
+            budget_limits[role] = self._parse_currency_limits(
+                {role: role_limits},
+                "GATEWAY_ROLE_BUDGET_LIMITS",
+            )[role]
 
-        self.budget_db_path = Path(
-            budget_db_path
-            or os.getenv("GATEWAY_BUDGET_DB_PATH", "cumulative_budgets.sqlite3")
+        tool_permissions = policy.get("tool_permissions")
+        if not isinstance(tool_permissions, dict) or not tool_permissions:
+            raise ValueError("tool_permissions must be a non-empty mapping.")
+        for tool, roles in tool_permissions.items():
+            if (
+                not isinstance(tool, str)
+                or not tool
+                or not isinstance(roles, list)
+                or not roles
+                or any(not isinstance(role, str) or not role for role in roles)
+            ):
+                raise ValueError("Each tool permission must have a non-empty role list.")
+        revision = hashlib.sha256(policy_content).hexdigest()
+        role_budget_limits = {
+            role: limits["USD"]
+            for role, limits in budget_limits.items()
+            if "USD" in limits
+        }
+        role_limits = {
+            role: limits["USD"]
+            for role, limits in transaction_limits.items()
+            if "USD" in limits
+        }
+        with self._policy_lock:
+            self.critical_financial_limits = critical_limits
+            self.role_currency_transaction_limits = transaction_limits
+            self.role_currency_budget_limits = budget_limits
+            self.role_budget_limits = role_budget_limits
+            self.role_limits = role_limits
+            self.tool_permissions = {
+                tool: list(roles) for tool, roles in tool_permissions.items()
+            }
+            self.policy_revision = revision
+        logger.info(
+            "Reloaded gateway policy revision=%s transaction_limits=%s "
+            "cumulative_limits=%s",
+            revision,
+            transaction_limits,
+            budget_limits,
         )
-        self._initialize_budget_store()
+        return revision
 
     def _initialize_budget_store(self) -> None:
         try:
@@ -407,7 +497,8 @@ class UnifiedGovernanceEngine:
         if not isinstance(currency, str) or not currency.strip():
             raise ValueError("Currency must be a non-empty string.")
         currency = currency.strip().upper()
-        budget_limit = self.role_currency_budget_limits.get(role, {}).get(currency)
+        with self._policy_lock:
+            budget_limit = self.role_currency_budget_limits.get(role, {}).get(currency)
         if budget_limit is None:
             raise UnsupportedCurrencyError(
                 f"No cumulative budget policy is configured for role {role!r} in {currency}."
@@ -1169,7 +1260,10 @@ class UnifiedGovernanceEngine:
         if not isinstance(role, str) or not role:
             return 2, ["Unauthenticated invocation: Role missing from verified context"], metadata
 
-        allowed_roles = self.tool_permissions.get(tool)
+        with self._policy_lock:
+            allowed_roles = self.tool_permissions.get(tool)
+            transaction_limits = self.role_currency_transaction_limits
+            critical_limits = self.critical_financial_limits
         if allowed_roles and role not in allowed_roles:
             violations.append(f"Role '{role}' is unauthorized for execution of tool '{tool}'")
             dof += 2
@@ -1189,10 +1283,8 @@ class UnifiedGovernanceEngine:
                         if isinstance(currency_raw, str)
                         else ""
                     )
-                    role_limit = ROLE_CURRENCY_TRANSACTION_LIMITS.get(
-                        role, {}
-                    ).get(currency)
-                    critical_limit = self.critical_financial_limits.get(currency)
+                    role_limit = transaction_limits.get(role, {}).get(currency)
+                    critical_limit = critical_limits.get(currency)
                     if not amount.is_finite() or amount <= Decimal("0"):
                         violations.append("Amount must be strictly positive")
                         dof += 2

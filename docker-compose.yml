@@ -3,11 +3,39 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gateway
+    environment:
+      TOKEN_IDENTITY_MAP: ${TOKEN_IDENTITY_MAP:?Set TOKEN_IDENTITY_MAP to a JSON identity map}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - internal-only-net
       - external-net
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal-only-net
 
   ai-agent:
     build:
@@ -15,6 +43,7 @@ services:
       dockerfile: Dockerfile.agent
     environment:
       GATEWAY_URL: http://intent-gateway:8000
+      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:?Set GATEWAY_API_TOKEN to a token in TOKEN_IDENTITY_MAP}
       HTTP_PROXY: http://intent-gateway:8000
       HTTPS_PROXY: http://intent-gateway:8000
     depends_on:
@@ -35,3 +64,6 @@ networks:
   internal-only-net:
     internal: true
   external-net:
+
+volumes:
+  redis-data:

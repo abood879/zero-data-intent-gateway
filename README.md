@@ -73,4 +73,8 @@ python3 -m pytest tests/ -v
 
 `python3 benchmarks/benchmark.py` measures only local deterministic policy evaluation; it does not perform an audit append. Its results are not end-to-end gateway latency or a claim about performance under concurrent load.
 
+The Compose deployment routes agent transfers through `POST /v1/proxy/transfers`; the gateway applies policy and budget checks before forwarding to the mock provider. Redis on the internal network supplies a distributed async lock per idempotency key; the durable SQLite transaction remains authoritative for budget and idempotency state. When `REDIS_URL` is configured, lock-service errors fail closed; without it, local development uses SQLite's transactional protection. Set `TOKEN_IDENTITY_MAP` to a JSON token-to-identity map and set `GATEWAY_API_TOKEN` to one of the tokens in that map before running `docker compose up --build`. The proxy is an API endpoint, not a general-purpose HTTP `CONNECT` proxy.
+
+Gateway transaction limits, cumulative role budgets, and tool permissions are loaded from `config/policies.yaml`. The `POST /v1/admin/reload-policies` endpoint re-reads this mounted file without restarting Uvicorn and is restricted to identities with the `admin` or `governance_admin` role. Environment overrides such as `GATEWAY_CRITICAL_LIMIT_<CURRENCY>` and `GATEWAY_ROLE_BUDGET_LIMITS` take precedence over file values.
+
 For the current security model, deployment limitations, and configuration details, see [SECURITY.md](SECURITY.md).

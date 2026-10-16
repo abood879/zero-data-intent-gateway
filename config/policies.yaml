@@ -20,3 +20,45 @@ allowed_departments:
   - "Security"
 
 max_auto_approval_limit: 5000.0
+
+gateway_policy:
+  critical_financial_limits:
+    USD: "5000"
+    EUR: "4500"
+  role_transaction_limits:
+    finance_operator:
+      USD: "5000"
+      EUR: "4500"
+    finance_agent:
+      USD: "10000"
+      EUR: "9000"
+    admin:
+      USD: "25000"
+      EUR: "20000"
+  role_budget_limits:
+    finance_agent:
+      USD: "10000"
+      EUR: "9000"
+    finance_operator:
+      USD: "10000"
+      EUR: "9000"
+    admin:
+      USD: "25000"
+      EUR: "20000"
+    agent:
+      USD: "2000"
+  tool_permissions:
+    database_drop:
+      - superadmin
+    admin_execute:
+      - admin
+    wire_transfer:
+      - finance_agent
+      - finance_operator
+      - admin
+    read_records:
+      - guest
+      - agent
+      - support_agent
+      - finance_agent
+      - admin

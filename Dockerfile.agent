@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY sdk.py agent.py ./
 
-CMD ["python", "agent.py"]
+CMD ["sh", "-c", "sleep 5 && python agent.py"]

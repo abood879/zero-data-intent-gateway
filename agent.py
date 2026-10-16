@@ -91,6 +91,45 @@ def main() -> int:
     provider_url = os.getenv(
         "MOCK_PROVIDER_URL", "http://127.0.0.1:8090"
     ).rstrip("/")
+    gateway_url = os.getenv("GATEWAY_URL")
+    if gateway_url:
+        gateway_token = os.getenv("GATEWAY_API_TOKEN")
+        if not gateway_token:
+            print(
+                "GATEWAY_API_TOKEN must be configured when GATEWAY_URL is set.",
+                file=sys.stderr,
+            )
+            return 2
+        transfer_payload = {
+            "amount": args.amount,
+            "currency": currency,
+            "recipient": args.recipient,
+            "idempotency_key": idempotency_key,
+        }
+        try:
+            with httpx.Client(timeout=10, trust_env=False) as client:
+                response = client.post(
+                    f"{gateway_url.rstrip('/')}/v1/proxy/transfers",
+                    headers={
+                        "Authorization": f"Bearer {gateway_token}",
+                        "Idempotency-Key": idempotency_key,
+                    },
+                    json=transfer_payload,
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            print(
+                f"Gateway rejected the transfer ({exc.response.status_code}): "
+                f"{exc.response.text}",
+                file=sys.stderr,
+            )
+            return 1
+        except httpx.HTTPError as exc:
+            print(f"Gateway communication failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(response.json(), indent=2, sort_keys=True))
+        return 0
+
     try:
         timeout_seconds = float(os.getenv("AGENT_PROVIDER_TIMEOUT_SECONDS", "5"))
     except ValueError:
