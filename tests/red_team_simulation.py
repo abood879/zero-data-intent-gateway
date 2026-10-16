@@ -24,7 +24,7 @@ async def test_prompt_injection_payload_is_rejected_before_provider():
     payload = {
         "amount": "50.00",
         "currency": "USD",
-        "recipient_id": "attacker_wallet",
+        "recipient": "attacker_wallet",
         "idempotency_key": idempotency_key,
         "metadata": {
             "prompt": (
@@ -57,7 +57,7 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
     payload = {
         "amount": "10.00",
         "currency": "USD",
-        "recipient_id": "merchant_wallet",
+        "recipient": "merchant_wallet",
         "idempotency_key": idempotency_key,
     }
 
@@ -69,15 +69,14 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
                 headers=_headers(idempotency_key),
             )
 
-    # Send concurrent duplicate requests
+    # إرسال طلبين متزامنين بنفس مفتاح عدم التكرار
     responses = await asyncio.gather(_send(), _send())
     status_codes = [r.status_code for r in responses]
 
-    # At least one request must succeed, other must be either 200 (cached replay) or 409 (conflict)
     assert 200 in status_codes, f"Expected at least one 200 OK, got: {status_codes}"
     assert all(code in (200, 409) for code in status_codes), f"Unexpected status codes: {status_codes}"
 
-    # Strict financial invariance verification: Mock provider must record exactly 1 dispatch
+    # إثبات الحصانة المالية: المزود الخارجي يجب أن يسجل تنفيذاً واحداً فقط
     async with httpx.AsyncClient(timeout=10.0) as client:
         provider_lookup = await client.get(
             f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
@@ -96,12 +95,12 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
     payload = {
         "amount": "5.00",
         "currency": "USD",
-        "recipient_id": "merchant_wallet",
+        "recipient": "merchant_wallet",
         "idempotency_key": idempotency_key,
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # First request
+        # الطلب الأول
         res1 = await client.post(
             f"{GATEWAY_URL}/v1/proxy/transfers",
             json=payload,
@@ -109,7 +108,7 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
         )
         assert res1.status_code == 200, f"Initial request failed: {res1.text}"
 
-        # Duplicate sequential request
+        # الطلب المكرر اللاحق
         res2 = await client.post(
             f"{GATEWAY_URL}/v1/proxy/transfers",
             json=payload,
@@ -117,7 +116,7 @@ async def test_sequential_duplicate_request_returns_cached_or_rejected_without_r
         )
         assert res2.status_code in (200, 409), f"Unexpected replay status: {res2.status_code}"
 
-        # Verify provider dispatch count remains exactly 1
+        # التحقق من أن المزود لم يستلم أي طلب إضافي وظل العدد 1 بالضبط
         provider_lookup = await client.get(
             f"{MOCK_PROVIDER_URL}/v1/transfers/{idempotency_key}"
         )
