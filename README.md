@@ -29,14 +29,14 @@ The production design places an independent egress gateway between agent workloa
 - The gateway is intended to be a separate process and network-enforced security boundary, not merely an SDK decorator.
 - A durable dispatch-intent record and a provider-supported idempotency key provide the basis for crash recovery and reconciliation. An intent record alone cannot prove whether a remote provider completed an operation.
 
-### Ultra-Low Latency State Engine
+### Planned Distributed State Engine
 
-The current implementation uses SQLite for budget reservations and local durable state. Enterprise Blueprint v2 envisions moving the shared, distributed control plane to PostgreSQL and/or Redis, selected according to each operation's consistency and durability requirements.
+The current implementation is a Python gateway using SQLite for budget reservations and local durable state. SQLite serializes writes, so contention can constrain throughput; this repository does not establish production latency or capacity limits. Enterprise Blueprint v2 envisions moving the shared, distributed control plane to PostgreSQL and/or Redis, selected according to each operation's consistency and durability requirements.
 
 - PostgreSQL is a candidate for transactional budget, idempotency, and outbox state across gateway instances.
 - Redis with carefully scoped atomic scripts is a candidate for latency-sensitive coordination where its persistence and recovery guarantees meet the deployment requirements.
 - Audit events are intended to flow through an outbox to Kafka or Redpanda, with asynchronous external/WORM anchoring.
-- Sub-millisecond distributed operation is a design target to validate with representative benchmarks and failure testing, not a performance guarantee of the current repository.
+- Sub-millisecond distributed operation is an unvalidated design objective, not a measured result or performance guarantee. The current benchmark measures only deterministic local policy evaluation and performs no audit append; it excludes SQLite reservations, audit persistence, HTTP, concurrency, and provider/network latency.
 
 ### Deterministic Idempotency Lifecycle
 
@@ -70,5 +70,7 @@ The codebase is an evolving implementation, not yet the complete Enterprise Blue
 ```bash
 python3 -m pytest tests/ -v
 ```
+
+`python3 benchmarks/benchmark.py` measures only local deterministic policy evaluation; it does not perform an audit append. Its results are not end-to-end gateway latency or a claim about performance under concurrent load.
 
 For the current security model, deployment limitations, and configuration details, see [SECURITY.md](SECURITY.md).
