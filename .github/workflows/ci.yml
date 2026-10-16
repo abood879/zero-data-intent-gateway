@@ -37,6 +37,7 @@ jobs:
 
       - name: Run Standard Suite
         env:
+          PYTHONPATH: .
           REDIS_URL: redis://localhost:6379/0
           SECRET_KEY: test-secret-key
           GATEWAY_API_TOKEN: test-token
@@ -74,6 +75,7 @@ jobs:
 
       - name: Start Mock Provider
         env:
+          PYTHONPATH: .
           REDIS_URL: "redis://localhost:6379/0"
         run: |
           nohup python -m uvicorn mock_provider:app --host 127.0.0.1 --port 8090 > /tmp/provider.log 2>&1 &
@@ -81,6 +83,7 @@ jobs:
 
       - name: Start Gateway Server
         env:
+          PYTHONPATH: .
           REDIS_URL: "redis://localhost:6379/0"
           MOCK_PROVIDER_URL: "http://127.0.0.1:8090"
           GATEWAY_API_TOKEN: "test-token"
@@ -93,6 +96,7 @@ jobs:
 
       - name: Run Red-Team Simulation Tests
         env:
+          PYTHONPATH: .
           GATEWAY_URL: "http://127.0.0.1:8000"
           MOCK_PROVIDER_URL: "http://127.0.0.1:8090"
           GATEWAY_API_TOKEN: "test-token"

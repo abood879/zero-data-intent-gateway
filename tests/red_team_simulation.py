@@ -22,7 +22,7 @@ async def test_prompt_injection_payload_is_rejected_before_provider():
     payload = {
         "amount": "50.00",
         "currency": "USD",
-        "recipient": "attacker_wallet",
+        "recipient_id": "attacker_wallet",
         "idempotency_key": idempotency_key,
         "metadata": {
             "prompt": (
@@ -44,7 +44,6 @@ async def test_prompt_injection_payload_is_rejected_before_provider():
     assert response.status_code == 400, response.text
     detail = response.json()["detail"]
     
-    # Handle string detail or dict detail gracefully
     if isinstance(detail, dict):
         error_msg = detail.get("error", str(detail))
     else:
@@ -62,7 +61,7 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
     payload = {
         "amount": "25.00",
         "currency": "USD",
-        "recipient": "merchant_wallet",
+        "recipient_id": "merchant_wallet",
         "idempotency_key": idempotency_key,
     }
 
@@ -77,7 +76,7 @@ async def test_concurrent_duplicate_requests_dispatch_to_provider_once():
     responses = await asyncio.gather(_send(), _send())
     status_codes = [r.status_code for r in responses]
 
-    assert 200 in status_codes
+    assert 200 in status_codes, f"Expected 200 in status codes, got: {status_codes}"
     assert all(code in (200, 409) for code in status_codes)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
