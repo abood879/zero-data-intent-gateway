@@ -22,8 +22,8 @@ except ImportError:
                 elif operation == _FcntlShim.LOCK_UN:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        raise AuditLedgerError(f'Failed to release OS file lock: {exc}') from exc
             finally:
                 os.lseek(fd, current_pos, os.SEEK_SET)
 
