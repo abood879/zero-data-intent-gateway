@@ -1,80 +1,32 @@
-services:
-  intent-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile.gateway
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zero-data-postgres
     environment:
-      TOKEN_IDENTITY_MAP: ${TOKEN_IDENTITY_MAP:?Set TOKEN_IDENTITY_MAP to a JSON identity map}
-      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DB: gateway_governance
+      POSTGRES_USER: gateway_admin
+      POSTGRES_PASSWORD: gateway_secure_password
     ports:
-      - "8000:8000"
+      - "5432:5432"
     volumes:
-      - ./config:/app/config:ro
+      - ./migrations/001_initial_postgres_schema.sql:/docker-entrypoint-initdb.d/001_initial_postgres_schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      test: ["CMD-SHELL", "pg_isready -U gateway_admin -d gateway_governance"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 5
-      start_period: 10s
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - internal-only-net
-      - external-net
 
   redis:
     image: redis:7-alpine
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - always
-      - --maxmemory-policy
-      - noeviction
+    container_name: zero-data-redis
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
-    volumes:
-      - redis-data:/data
-    networks:
-      - internal-only-net
-
-  ai-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile.agent
-    environment:
-      GATEWAY_URL: http://intent-gateway:8000
-      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:?Set GATEWAY_API_TOKEN to a token in TOKEN_IDENTITY_MAP}
-      HTTP_PROXY: http://intent-gateway:8000
-      HTTPS_PROXY: http://intent-gateway:8000
-    depends_on:
-      intent-gateway:
-        condition: service_healthy
-    networks:
-      - internal-only-net
-
-  mock-provider:
-    build:
-      context: .
-      dockerfile: Dockerfile.mock
-    ports:
-      - "8090:8090"
-    networks:
-      - external-net
-
-networks:
-  internal-only-net:
-    internal: true
-  external-net:
 
 volumes:
-  redis-data:
+  pgdata:
