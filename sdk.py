@@ -1,5 +1,34 @@
 import functools
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    import msvcrt
+    import os
+
+    class _FcntlShim:
+        LOCK_SH = 1
+        LOCK_EX = 2
+        LOCK_NB = 4
+        LOCK_UN = 8
+
+        @staticmethod
+        def flock(fd, operation):
+            try:
+                # الحفاظ على مؤشر الملف الحالي وقفل أول 1 بايت كعلامة مزامنة
+                current_pos = os.lseek(fd, 0, os.SEEK_CUR)
+                os.lseek(fd, 0, os.SEEK_SET)
+                if operation in (_FcntlShim.LOCK_EX, _FcntlShim.LOCK_SH):
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                elif operation == _FcntlShim.LOCK_UN:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                os.lseek(fd, current_pos, os.SEEK_SET)
+            except OSError:
+                pass
+
+    fcntl = _FcntlShim()
 import hashlib
 import hmac
 import inspect

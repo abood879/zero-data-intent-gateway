@@ -1277,8 +1277,11 @@ class UnifiedGovernanceEngine:
                 if not isinstance(recipient_val, str) or not recipient_val.strip():
                     violations.append("Recipient identifier must be a non-empty string.")
                     dof += 2
-                elif self.allowed_recipients and recipient_val.strip() not in self.allowed_recipients:
-                    violations.append(f"Recipient '{recipient_val}' is not in allowed recipient policy")
+                elif not self.allowed_recipients:
+                    violations.append("Security Invariant Violation: No allowed recipients configured in gateway policy (Fail-Closed).")
+                    dof += 2
+                elif recipient_val.strip() not in self.allowed_recipients:
+                    violations.append(f"Recipient '{recipient_val}' is not in allowed recipient policy.")
                     dof += 2
             amount_raw = params.get("amount")
             if amount_raw is None:

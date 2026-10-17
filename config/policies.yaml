@@ -25,7 +25,6 @@ gateway_policy:
   allowed_recipients:
     - "account-1"
     - "merchant_wallet"
-    - "attacker_wallet"
     - "vendor_primary"
     - "vendor_secondary"
   critical_financial_limits:

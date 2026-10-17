@@ -54,7 +54,7 @@ A mismatched payload hash is rejected as an idempotency conflict. The production
 
 The project has undergone a rigorous architectural Red-Team review focused on the boundary between an in-process SDK and a distributed financial gateway. The review highlighted the need for network-enforced egress control, durable state shared across workers, deterministic retry identity, and explicit handling of uncertain provider outcomes.
 
-- **Test result:** `python3 -m pytest tests/ -v` passed **63/63 tests** in the current full test suite, including adversarial coverage for in-flight network failures locking budgets for reconciliation, currency-isolated budget tracking, and rejection of payload tampering.
+- **Test result:** `python3 -m pytest tests/ -v` passed **73/73 tests** in the current full test suite, including adversarial coverage for in-flight network failures locking budgets for reconciliation, currency-isolated budget tracking, and rejection of payload tampering.
 - **Lifecycle hardening:** Matching retries after a confirmed pre-dispatch abort are permitted; committed duplicates receive cached confirmations; post-dispatch exceptions remain unresolved for reconciliation.
 - **Architecture assessment:** Enterprise Blueprint v2 received an **8.5/10** vision assessment as a production-grade paradigm for enterprise FinTech integration. This is an architectural assessment, not a certification or evidence that the target distributed components are already deployed.
 
