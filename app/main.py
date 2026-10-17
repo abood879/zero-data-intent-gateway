@@ -581,7 +581,7 @@ def evaluate_legacy_transaction(
     dof, violations = governance_engine.evaluate(
         {
             "tool": "wire_transfer",
-            "parameters": {"amount": request.amount},
+            "parameters": {"amount": request.amount, "recipient": "vendor_primary"},
             "context": context,
         }
     )[:2]

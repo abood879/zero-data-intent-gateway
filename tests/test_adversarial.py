@@ -57,7 +57,7 @@ def _execute_transfer_in_process(amount: str) -> bool:
     from sdk import SecurityViolationError, protected_tool
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     context = gateway_main._issue_trusted_context(
@@ -279,7 +279,7 @@ def test_server_enforced_financial_limits_override_client_injection():
         headers={"Authorization": f"Bearer {TEST_TOKEN}"},
         json={
             "tool": "wire_transfer",
-            "parameters": {"amount": "6000.00"},
+            "parameters": {"amount": "6000.00", "recipient": "vendor_primary"},
             "context": {
                 "role": "admin",
                 "user_id": "attacker",
@@ -434,7 +434,7 @@ def test_max_allowed_dof_does_not_bypass_financial_step_up():
     )
 
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=1)
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(DisambiguationRequiredError):
@@ -442,7 +442,7 @@ def test_max_allowed_dof_does_not_bypass_financial_step_up():
 
     token = gateway_main._issue_step_up_approval_token(
         tool="wire_transfer",
-        parameters={"amount": "6000.00"},
+        parameters={"amount": "6000.00", "recipient": "vendor_primary"},
         identity={"role": "finance_agent", "user_id": "finance-user"},
         expires_at=time.time() + 60,
     )
@@ -464,7 +464,7 @@ def test_step_up_nonce_is_persistent_across_store_instances(tmp_path, monkeypatc
     identity = {"role": "finance_agent", "user_id": "persistent-user"}
     token = gateway_main._issue_step_up_approval_token(
         tool="wire_transfer",
-        parameters={"amount": "6000.00"},
+        parameters={"amount": "6000.00", "recipient": "vendor_primary"},
         identity=identity,
         expires_at=time.time() + 60,
     )
@@ -472,7 +472,7 @@ def test_step_up_nonce_is_persistent_across_store_instances(tmp_path, monkeypatc
     assert sdk.verify_step_up_approval_token(
         token,
         tool="wire_transfer",
-        parameters={"amount": "6000.00"},
+        parameters={"amount": "6000.00", "recipient": "vendor_primary"},
         identity=identity,
     )
 
@@ -481,7 +481,7 @@ def test_step_up_nonce_is_persistent_across_store_instances(tmp_path, monkeypatc
     assert not sdk.verify_step_up_approval_token(
         token,
         tool="wire_transfer",
-        parameters={"amount": "6000.00"},
+        parameters={"amount": "6000.00", "recipient": "vendor_primary"},
         identity=identity,
     )
 
@@ -563,7 +563,7 @@ def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
     identity = {"role": "finance_agent", "user_id": "finance-user"}
     token = gateway_main._issue_step_up_approval_token(
         tool="wire_transfer",
-        parameters={"amount": "6000.00"},
+        parameters={"amount": "6000.00", "recipient": "vendor_primary"},
         identity=identity,
         expires_at=time.time() + 60,
     )
@@ -574,7 +574,7 @@ def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
     monkeypatch.setattr(sdk.step_up_nonce_store, "consume", unavailable_store)
 
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=1)
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         pytest.fail("Execution must not proceed if nonce consumption fails.")
 
     with pytest.raises(AuditLedgerError, match="nonce store unavailable"):
@@ -587,7 +587,7 @@ def test_step_up_nonce_store_failure_fails_closed(monkeypatch):
 
 def test_max_allowed_dof_cannot_bypass_security_invariants():
     @protected_tool(tool_name="wire_transfer", max_allowed_dof=99)
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError):
@@ -637,7 +637,7 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def failing_transfer(amount: str, idempotency_key: str):
+    def failing_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         raise ConfirmedToolFailureError("transfer failed before mutation")
 
     with pytest.raises(ConfirmedToolFailureError, match="before mutation"):
@@ -646,7 +646,7 @@ def test_failed_transfer_releases_budget_for_next_valid_transaction(
     assert budget_reservation_statuses(budget_path, user_id) == ["RELEASED"]
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str, idempotency_key: str):
+    def valid_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     assert valid_transfer(amount="4000.00", __context__=context) == "TRANSFERRED"
@@ -667,7 +667,7 @@ def test_pre_dispatch_abort_allows_same_key_retry_with_matching_payload(
     calls = 0
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -731,7 +731,7 @@ def test_confirmed_failure_after_dispatch_requires_reconciliation(
     transport = sdk.SecureProviderTransport(provider_dispatch)
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return transport.dispatch(
             idempotency_key=idempotency_key,
             payload={"amount": amount},
@@ -771,7 +771,7 @@ def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def timed_out_transfer(amount: str, idempotency_key: str):
+    def timed_out_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         raise TimeoutError("connection lost after external debit")
 
     with pytest.raises(TimeoutError, match="after external debit"):
@@ -784,7 +784,7 @@ def test_ambiguous_transfer_timeout_locks_budget(tmp_path, monkeypatch):
     assert ledger.chain[-1]["decision"] == "OUTCOME_UNKNOWN"
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str, idempotency_key: str):
+    def valid_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
@@ -807,7 +807,7 @@ def test_success_after_reservation_expiry_commits_without_orphaning(
     context = trusted_context("finance_agent", user_id)
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer_after_expiry(amount: str, idempotency_key: str):
+    def transfer_after_expiry(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         with sqlite3.connect(budget_path) as connection:
             connection.execute(
                 "UPDATE cumulative_budget_reservations SET expires_at = 0 "
@@ -824,7 +824,7 @@ def test_success_after_reservation_expiry_commits_without_orphaning(
     assert ledger.chain[-1]["status"] == "EXECUTION_SUCCESS"
 
     @protected_tool(tool_name="wire_transfer")
-    def valid_transfer(amount: str, idempotency_key: str):
+    def valid_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(SecurityViolationError, match="Cumulative financial budget"):
@@ -840,7 +840,7 @@ def test_successful_transfer_commits_budget_reservation(tmp_path, monkeypatch):
     user_id = "reservation-commit-user"
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     assert (
@@ -880,17 +880,17 @@ async def test_protected_tool_forwards_resolved_idempotency_key(
     variadic_keys = []
 
     @protected_tool(tool_name="wire_transfer")
-    def explicit_transfer(amount: str, idempotency_key: str):
+    def explicit_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         explicit_keys.append(idempotency_key)
         return "TRANSFERRED"
 
     @protected_tool(tool_name="wire_transfer")
-    def positional_only_transfer(amount: str, idempotency_key: str, /):
+    def positional_only_transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary", /):
         positional_only_keys.append(idempotency_key)
         return "TRANSFERRED"
 
     @protected_tool(tool_name="wire_transfer")
-    async def variadic_transfer(amount: str, **kwargs):
+    async def variadic_transfer(amount: str, recipient: str = "vendor_primary", **kwargs):
         variadic_keys.append(kwargs["idempotency_key"])
         return "TRANSFERRED"
 
@@ -1023,7 +1023,7 @@ def test_audit_events_include_budget_correlation_fields(tmp_path, monkeypatch):
     idempotency_key = "audit-correlation-key"
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str, currency: str):
+    def transfer(amount: str, idempotency_key: str, currency: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     assert transfer(
@@ -1049,7 +1049,7 @@ def test_currency_specific_single_transaction_limits_fail_closed_or_step_up():
     dof, violations, metadata = governance_engine.evaluate(
         {
             "tool": "wire_transfer",
-            "parameters": {"amount": "4900", "currency": "EUR"},
+            "parameters": {"amount": "4900", "currency": "EUR", "recipient": "vendor_primary"},
             "context": {"role": "finance_agent", "user_id": "eur-limit-user"},
         }
     )
@@ -1854,7 +1854,7 @@ def test_successful_transfer_with_audit_failure_locks_cumulative_budget(
     monkeypatch.setattr(ledger, "record", fail_success_record)
 
     @protected_tool(tool_name="wire_transfer")
-    def transfer(amount: str, idempotency_key: str):
+    def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
@@ -1897,7 +1897,7 @@ async def test_async_success_with_audit_failure_flags_reconciliation(
     monkeypatch.setattr(ledger, "record", fail_success_record)
 
     @protected_tool(tool_name="wire_transfer")
-    async def transfer(amount: str, idempotency_key: str):
+    async def transfer(amount: str, idempotency_key: str, recipient: str = "vendor_primary"):
         return "TRANSFERRED"
 
     with pytest.raises(CriticalAuditFailureError, match="RECONCILIATION_REQUIRED"):
@@ -2009,7 +2009,7 @@ def test_api_ignores_client_supplied_identity_on_legacy_path():
         headers={"Authorization": f"Bearer {TEST_TOKEN}"},
         json={
             "tool": "wire_transfer",
-            "parameters": {"amount": "6000.00"},
+            "parameters": {"amount": "6000.00", "recipient": "vendor_primary"},
             "context": {
                 "role": "admin",
                 "user_id": "attacker",
@@ -2045,7 +2045,7 @@ def test_evaluate_alias_uses_server_token_identity():
         headers={"Authorization": f"Bearer {TEST_TOKEN}"},
         json={
             "tool": "wire_transfer",
-            "parameters": {"amount": "6000.00"},
+            "parameters": {"amount": "6000.00", "recipient": "vendor_primary"},
             "context": {"role": "admin", "max_limit": "999999.00"},
         },
     )

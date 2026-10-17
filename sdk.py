@@ -13,20 +13,19 @@ except ImportError:
 
         @staticmethod
         def flock(fd, operation):
+            current_pos = os.lseek(fd, 0, os.SEEK_CUR)
+            os.lseek(fd, 0, os.SEEK_SET)
             try:
-                # الحفاظ على مؤشر الملف الحالي وقفل أول 1 بايت كعلامة مزامنة
-                current_pos = os.lseek(fd, 0, os.SEEK_CUR)
-                os.lseek(fd, 0, os.SEEK_SET)
                 if operation in (_FcntlShim.LOCK_EX, _FcntlShim.LOCK_SH):
+                    # Fail-Closed: إذا فشل القفل بعد 10 محاولات، نرمي خطأ ولا نتجاهله أبداً
                     msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
                 elif operation == _FcntlShim.LOCK_UN:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                     except OSError:
                         pass
+            finally:
                 os.lseek(fd, current_pos, os.SEEK_SET)
-            except OSError:
-                pass
 
     fcntl = _FcntlShim()
 import hashlib
@@ -970,6 +969,7 @@ def _bound_tool_parameters(
     kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     bound = signature.bind_partial(*args, **kwargs)
+    bound.apply_defaults()
     parameters: dict[str, Any] = {}
     for name, value in bound.arguments.items():
         parameter = signature.parameters[name]
